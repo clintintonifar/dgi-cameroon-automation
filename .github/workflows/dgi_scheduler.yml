@@ -1,0 +1,53 @@
+# =============================================================================
+# DGI Cameroon - Monthly Automated Downloader
+# Runs on the 5th of every month at 03:00 UTC
+# =============================================================================
+
+name: DGI Monthly Downloader
+
+on:
+  schedule:
+    # Cron syntax: Minute Hour Day Month DayOfWeek
+    # Runs at 03:00 UTC on the 5th of every month
+    - cron: '0 3 5 * *'
+  
+  # Allow manual trigger for testing
+  workflow_dispatch:
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    
+    steps:
+    # Step 1: Checkout repository code
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # Step 2: Setup Python environment
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    # Step 3: Install Python dependencies
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    # Step 4: Run the DGI downloader script
+    - name: Run DGI Downloader
+      env:
+        # Pass GitHub Secrets as environment variables to the script
+        DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+        GOOGLE_DRIVE_CREDENTIALS: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}
+      run: python src/download_dgi.py
+
+    # Step 5: Upload logs as artifact (for debugging if needed)
+    - name: Upload download logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: dgi-download-logs-${{ github.run_number }}
+        path: /tmp/dgi_downloads/
+        retention-days: 7

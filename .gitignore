@@ -205,3 +205,21 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+# DGI Project Specific
+# Credentials and secrets
+credentials.json
+*.key
+*.pem
+secrets.json
+.env
+
+# Temporary download directory
+/tmp/
+*.tmp
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
