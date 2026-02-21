@@ -30,11 +30,7 @@ FRENCH_MONTHS = {
     9: 'SEPTEMBRE', 10: 'OCTOBRE', 11: 'NOVEMBRE', 12: 'DECEMBRE'
 }
 
-# The canonical set of columns we keep (intersection of old+new, relevant ones)
-# Old format had extra cols: VENTE_BOISSON, BOITE_POSTALE, TELEPHONE, FORME_JURIDIQUE,
-#   REGION_ADMINISTRATIVE, DEPARTEMENT, VILLE, COMMUNE, QUARTIER, LIEUX_DIT, ETATNIU, EXERCICE, MOIS
-# New format (2024+) has fewer cols.
-# We keep only the columns present in BOTH formats, dropping legacy-only ones.
+# Canonical columns present in both old and new file formats
 CANONICAL_COLUMNS = [
     'RAISON_SOCIALE',
     'SIGLE',
@@ -145,109 +141,110 @@ def download_file(year, month):
     return False
 
 # =============================================================================
-# COMBINE ALL EXCEL FILES INTO ONE CSV
+# COLUMN NORMALIZATION
 # =============================================================================
 
-def normalize_columns(df):
+def normalize_columns(df, year, month):
     """
-    Normalize column names (strip whitespace, uppercase) and keep only
-    the canonical columns that exist in both old and new file formats.
-    Drops legacy-only columns silently.
+    Normalize column names, keep only canonical columns,
+    fill missing canonical columns with empty string,
+    and inject YEAR + MONTH.
     """
-    # Normalize column names
+    # Normalize column names: strip whitespace and uppercase
     df.columns = [str(c).strip().upper() for c in df.columns]
 
-    # Some old files use 'N°' or 'N' as the row index column — drop it
+    # Drop row-number index columns from old format
     for drop_col in ['N°', 'N', 'Nº']:
         if drop_col in df.columns:
             df = df.drop(columns=[drop_col])
 
-    # Keep only canonical columns that are actually present in this file
-    cols_present = [c for c in CANONICAL_COLUMNS if c in df.columns]
-    df = df[cols_present]
-
-    # Add any missing canonical columns as NaN so all frames align
+    # Keep only canonical columns; add missing ones as empty
     for col in CANONICAL_COLUMNS:
         if col not in df.columns:
-            df[col] = None
+            df[col] = ''
 
-    # Reorder to canonical order
-    df = df[CANONICAL_COLUMNS]
+    df = df[CANONICAL_COLUMNS].copy()
+
+    # Strip whitespace from all string values
+    for col in CANONICAL_COLUMNS:
+        df[col] = df[col].astype(str).str.strip().replace('nan', '')
+
+    # Inject source period
+    df.insert(0, 'MONTH', month)
+    df.insert(0, 'YEAR', year)
 
     return df
 
+# =============================================================================
+# COMBINE ALL EXCEL FILES INTO ONE CSV (Streaming - Memory Efficient)
+# =============================================================================
 
-def combine_to_csv():
+def combine_to_csv(newly_downloaded):
     """
-    Read all downloaded .xlsx files, normalize columns to the modern schema,
-    inject YEAR and MONTH columns, and write one combined CSV.
+    Stream-write all Excel files into a single CSV one file at a time.
+    Never holds more than one file in memory — avoids RAM spikes.
+    Skips full rebuild if no new files were downloaded and CSV exists.
     Returns the path to the CSV or None on failure.
     """
-    print("\n📊 Combining Excel files into single CSV...")
+    # Skip rebuild if nothing new was downloaded and CSV already exists
+    if newly_downloaded == 0 and os.path.exists(COMBINED_CSV):
+        size_mb = os.path.getsize(COMBINED_CSV) / 1024 / 1024
+        print(f"\n📊 No new files downloaded — reusing existing CSV ({size_mb:.1f} MB)")
+        return COMBINED_CSV
 
-    all_frames = []
+    print("\n📊 Combining Excel files into single CSV (streaming)...")
+
     xlsx_files = sorted([
         f for f in os.listdir(DOWNLOAD_DIR)
         if f.endswith('.xlsx') and f.startswith('FICHIER_')
     ])
 
     if not xlsx_files:
-        print("  ⚠️ No Excel files found to combine.")
+        print(" ⚠️ No Excel files found to combine.")
         return None
 
-    for filename in xlsx_files:
-        parsed = parse_filename_to_date(filename)
-        if parsed is None:
-            print(f"  ⚠ Skipping (unparseable name): {filename}")
-            continue
+    total_rows = 0
+    first_file = True
 
-        year, month = parsed
-        filepath = os.path.join(DOWNLOAD_DIR, filename)
+    with open(COMBINED_CSV, 'w', encoding='utf-8-sig', newline='') as out:
+        for i, filename in enumerate(xlsx_files, 1):
+            parsed = parse_filename_to_date(filename)
+            if parsed is None:
+                print(f"  ⚠ Skipping (unparseable name): {filename}")
+                continue
 
-        try:
-            # Read first sheet; header is on row 0
-            df = pd.read_excel(filepath, sheet_name=0, dtype=str, engine='openpyxl')
+            year, month = parsed
+            filepath = os.path.join(DOWNLOAD_DIR, filename)
 
-            # Drop completely empty rows
-            df = df.dropna(how='all')
+            try:
+                df = pd.read_excel(filepath, sheet_name=0, dtype=str, engine='openpyxl')
 
-            # Normalize columns & align to canonical schema
-            df = normalize_columns(df)
+                # Drop completely empty rows
+                df = df.dropna(how='all')
 
-            # Inject source year/month
-            df['YEAR'] = year
-            df['MONTH'] = month
+                # Normalize columns and inject YEAR/MONTH
+                df = normalize_columns(df, year, month)
 
-            all_frames.append(df)
-            print(f"  ✓ Read {len(df):,} rows from {filename}")
+                # Stream write: include header only for the first file
+                df.to_csv(out, index=False, header=first_file)
+                first_file = False
 
-        except Exception as e:
-            print(f"  ✗ Failed to read {filename}: {str(e)}")
-            continue
+                total_rows += len(df)
+                print(f"  [{i}/{len(xlsx_files)}] ✓ {filename} — {len(df):,} rows")
 
-    if not all_frames:
-        print("  ✗ No data frames to combine.")
+            except Exception as e:
+                print(f"  [{i}/{len(xlsx_files)}] ✗ Failed to read {filename}: {str(e)}")
+                continue
+
+    if total_rows == 0:
+        print("  ✗ No data written to CSV.")
         return None
 
-    combined = pd.concat(all_frames, ignore_index=True)
-
-    # Clean up: strip whitespace from string columns
-    for col in CANONICAL_COLUMNS:
-        combined[col] = combined[col].astype(str).str.strip().replace('nan', '')
-
-    # Final column order: YEAR, MONTH first for easy filtering
-    final_cols = ['YEAR', 'MONTH'] + CANONICAL_COLUMNS
-    combined = combined[final_cols]
-
-    combined.to_csv(COMBINED_CSV, index=False, encoding='utf-8-sig')
-
-    total_rows = len(combined)
     size_mb = os.path.getsize(COMBINED_CSV) / 1024 / 1024
     print(f"\n  ✅ Combined CSV ready: {total_rows:,} total rows, {size_mb:.1f} MB")
     print(f"     Path: {COMBINED_CSV}")
 
     return COMBINED_CSV
-
 
 # =============================================================================
 # GOOGLE DRIVE AUTHENTICATION (OAuth Refresh Token)
@@ -296,37 +293,38 @@ def authenticate_drive():
 # UPLOAD TO GOOGLE DRIVE
 # =============================================================================
 
-def upload_to_drive(service, drive_folder_id):
-    """Upload downloaded xlsx files + combined CSV to Google Drive folder"""
+def upload_to_drive(service, drive_folder_id, newly_downloaded):
+    """Upload new xlsx files + refreshed combined CSV to Google Drive"""
     if not service:
         print("  ⚠️ No Drive service - skipping upload")
         return 0
 
     uploaded = 0
 
-    # Upload all .xlsx files
-    for filename in os.listdir(DOWNLOAD_DIR):
-        if not filename.endswith('.xlsx'):
-            continue
-        try:
-            filepath = os.path.join(DOWNLOAD_DIR, filename)
-            file_metadata = {'name': filename, 'parents': [drive_folder_id]}
-            media = MediaFileUpload(
-                filepath,
-                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            )
-            service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields='id',
-                supportsAllDrives=True
-            ).execute()
-            print(f"  ✓ Uploaded: {filename}")
-            uploaded += 1
-        except Exception as e:
-            print(f"  ✗ Upload failed {filename}: {str(e)}")
+    # Only upload xlsx files if new ones were downloaded this run
+    if newly_downloaded > 0:
+        for filename in os.listdir(DOWNLOAD_DIR):
+            if not filename.endswith('.xlsx'):
+                continue
+            try:
+                filepath = os.path.join(DOWNLOAD_DIR, filename)
+                file_metadata = {'name': filename, 'parents': [drive_folder_id]}
+                media = MediaFileUpload(
+                    filepath,
+                    mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                )
+                service.files().create(
+                    body=file_metadata,
+                    media_body=media,
+                    fields='id',
+                    supportsAllDrives=True
+                ).execute()
+                print(f"  ✓ Uploaded: {filename}")
+                uploaded += 1
+            except Exception as e:
+                print(f"  ✗ Upload failed {filename}: {str(e)}")
 
-    # Upload combined CSV (overwrite existing one by deleting first)
+    # Always replace the combined CSV on Drive with the latest version
     if os.path.exists(COMBINED_CSV):
         try:
             csv_name = "DGI_COMBINED.csv"
@@ -442,8 +440,8 @@ def main():
             print(f"  → Progress: {i}/{len(months_to_process)} months")
             time.sleep(1)
 
-    # Step 2: Combine all Excel files into one CSV
-    csv_path = combine_to_csv()
+    # Step 2: Combine into CSV (skips rebuild if nothing new)
+    csv_path = combine_to_csv(newly_downloaded=downloaded)
 
     # Step 3: Authenticate Drive
     print("\n🔐 Authenticating Google Drive...")
@@ -452,7 +450,7 @@ def main():
     # Step 4: Upload + Cleanup
     if drive_service and DRIVE_FOLDER_ID:
         print("\n📤 Uploading to Google Drive...")
-        uploaded = upload_to_drive(drive_service, DRIVE_FOLDER_ID)
+        uploaded = upload_to_drive(drive_service, DRIVE_FOLDER_ID, newly_downloaded=downloaded)
         print(f"   Uploaded: {uploaded} files")
 
         print("\n🧹 Cleaning up files older than 5 years...")
@@ -468,7 +466,8 @@ def main():
     print(f"   Skipped:    {skipped} (not found)")
     print(f"   Failed:     {failed} (errors)")
     if csv_path:
-        print(f"   Combined CSV: {csv_path}")
+        size_mb = os.path.getsize(csv_path) / 1024 / 1024
+        print(f"   Combined CSV: {size_mb:.1f} MB → {csv_path}")
     print(f"Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
 
