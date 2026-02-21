@@ -1,6 +1,6 @@
 # =============================================================================
-# DGI Cameroon - Monthly Automated Downloader
-# Runs on the 5th of every month at 03:00 UTC
+# DGI Cameroon - Daily Automated Downloader
+# Runs EVERY DAY at 03:00 UTC
 # =============================================================================
 
 name: DGI Monthly Downloader
@@ -8,8 +8,8 @@ name: DGI Monthly Downloader
 on:
   schedule:
     # Cron syntax: Minute Hour Day Month DayOfWeek
-    # Runs at 03:00 UTC on the 5th of every month
-    - cron: '0 3 5 * *'
+    # Runs at 03:00 UTC EVERY DAY (catches late DGI uploads)
+    - cron: '0 3 * * *'
   
   # Allow manual trigger for testing
   workflow_dispatch:
