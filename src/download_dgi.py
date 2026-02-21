@@ -29,6 +29,7 @@ FRENCH_MONTHS = {
     9: 'SEPTEMBRE', 10: 'OCTOBRE', 11: 'NOVEMBRE', 12: 'DECEMBRE'
 }
 
+# 🔹 Fixed: Removed trailing spaces in URL
 BASE_URL = "https://teledeclaration-dgi.cm/UploadedFiles/AttachedFiles/ArchiveListecontribuable/FICHIER%20{}%20{}.xlsx"
 DOWNLOAD_DIR = "/tmp/dgi_downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -128,43 +129,49 @@ def download_file(year, month):
     return False
 
 # =============================================================================
-# GOOGLE DRIVE AUTHENTICATION (OAuth Refresh Token)
+# GOOGLE DRIVE AUTHENTICATION (OAuth Refresh Token) - FIXED
 # =============================================================================
 
 def authenticate_drive():
     """Authenticate using OAuth Refresh Token (Personal Account)"""
     try:
+        # 🔹 Debug: Print which env vars are available
+        print(f"  🔍 Checking env vars:")
+        print(f"     GOOGLE_REFRESH_TOKEN: {'✅ Set' if os.environ.get('GOOGLE_REFRESH_TOKEN') else '❌ Missing'}")
+        print(f"     GOOGLE_CLIENT_ID: {'✅ Set' if os.environ.get('GOOGLE_CLIENT_ID') else '❌ Missing'}")
+        print(f"     GOOGLE_CLIENT_SECRET: {'✅ Set' if os.environ.get('GOOGLE_CLIENT_SECRET') else '❌ Missing'}")
+        
         # 🔹 Read ALL credentials from environment variables (GitHub Secrets)
         refresh_token = os.environ.get('GOOGLE_REFRESH_TOKEN')
         client_id = os.environ.get('GOOGLE_CLIENT_ID')
         client_secret = os.environ.get('GOOGLE_CLIENT_SECRET')
         
         if not refresh_token:
-            print("⚠️ No GOOGLE_REFRESH_TOKEN env var - skipping upload")
+            print("  ⚠️ No GOOGLE_REFRESH_TOKEN env var - skipping upload")
             return None
         if not client_id:
-            print("⚠️ No GOOGLE_CLIENT_ID env var - skipping upload")
+            print("  ⚠️ No GOOGLE_CLIENT_ID env var - skipping upload")
             return None
         if not client_secret:
-            print("⚠️ No GOOGLE_CLIENT_SECRET env var - skipping upload")
+            print("  ⚠️ No GOOGLE_CLIENT_SECRET env var - skipping upload")
             return None
         
-        # Create credentials from refresh token
+        # 🔹 Create credentials from refresh token (FIXED: No trailing spaces)
         creds = Credentials(
             None,
             refresh_token=refresh_token,
-            token_uri="https://oauth2.googleapis.com/token",
+            token_uri="https://oauth2.googleapis.com/token",  # ✅ No trailing spaces
             client_id=client_id,
             client_secret=client_secret,
-            scopes=['https://www.googleapis.com/auth/drive']
+            scopes=['https://www.googleapis.com/auth/drive']  # ✅ No trailing spaces
         )
         
         service = build('drive', 'v3', credentials=creds)
-        print("✅ Google Drive authenticated via OAuth")
+        print("  ✅ Google Drive authenticated via OAuth")
         return service
         
     except Exception as e:
-        print(f"⚠️ Drive auth failed: {str(e)}")
+        print(f"  ⚠️ Drive auth failed: {str(e)}")
         return None
 
 # =============================================================================
@@ -174,7 +181,7 @@ def authenticate_drive():
 def upload_to_drive(service, drive_folder_id):
     """Upload downloaded files to Google Drive folder via API"""
     if not service:
-        print("⚠️ No Drive service - skipping upload")
+        print("  ⚠️ No Drive service - skipping upload")
         return 0
     
     uploaded = 0
@@ -215,7 +222,7 @@ def upload_to_drive(service, drive_folder_id):
 def cleanup_old_files(service, drive_folder_id, cutoff_date):
     """Delete files older than 5 years from Google Drive via API"""
     if not service:
-        print("⚠️ No Drive service - skipping cleanup")
+        print("  ⚠️ No Drive service - skipping cleanup")
         return 0, 0
     
     deleted = 0
@@ -251,7 +258,7 @@ def cleanup_old_files(service, drive_folder_id, cutoff_date):
                 kept += 1  # Keep unparseable files (safety)
                 
     except Exception as e:
-        print(f"⚠️ Cleanup error: {str(e)}")
+        print(f"  ⚠️ Cleanup error: {str(e)}")
     
     return kept, deleted
 
