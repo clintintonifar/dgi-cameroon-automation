@@ -38,9 +38,11 @@ jobs:
     # Step 4: Run the DGI downloader script
     - name: Run DGI Downloader
       env:
-        # Pass GitHub Secrets as environment variables to the script
+        # 🔹 PASS THE CORRECT SECRET NAMES TO THE SCRIPT 🔹
         DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-        GOOGLE_DRIVE_CREDENTIALS: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}
+        GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+        GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+        GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
       run: python src/download_dgi.py
 
     # Step 5: Upload logs as artifact (for debugging if needed)
