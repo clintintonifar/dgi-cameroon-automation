@@ -18,10 +18,11 @@
 #   preserving the same file ID and public sharing link forever.
 #   Only uses files().create() on the very first upload.
 #
-# Naming-convention fix (v2):
+# Naming-convention fix (v3):
 #   The DGI site uses inconsistent separators between FICHIER / MONTH / YEAR.
-#   build_candidate_urls() tries all 8 variants (4 separator combos × 2 cases)
-#   so files like FICHIER_MARS 2025.xlsx or FICHIER JUIN_2023.xlsx are found.
+#   build_candidate_urls() tries all 16 variants (8 separator combos × 2 cases).
+#   Covers simple separators (_  space) AND compound ones (space+_ or _+space),
+#   e.g. FICHIER _OCTOBRE 2023.xlsx (confirmed live URL: FICHIER%20_OCTOBRE%202023).
 # =============================================================================
 
 import os
@@ -123,23 +124,36 @@ def build_candidate_urls(month_name: str, year: int) -> list:
     """
     Return every plausible URL for one month's file.
 
-    The DGI site has used at least four naming conventions over the years:
-      • FICHIER JUIN 2025.xlsx   (space  / space)   ← original / most common
-      • FICHIER_JUIN 2025.xlsx   (under  / space)
-      • FICHIER JUIN_2025.xlsx   (space  / under)
-      • FICHIER_JUIN_2025.xlsx   (under  / under)
+    Confirmed naming conventions found on the DGI site so far:
+      • FICHIER JUIN 2025.xlsx      (%20  / %20)   ← most common
+      • FICHIER_JUIN 2025.xlsx      (_    / %20)
+      • FICHIER JUIN_2025.xlsx      (%20  / _)
+      • FICHIER_JUIN_2025.xlsx      (_    / _)
+      • FICHIER _OCTOBRE 2023.xlsx  (%20_ / %20)   ← confirmed Oct 2023
+      • FICHIER_ JUIN 2025.xlsx     (_%20 / %20)   ← defensive mirror
+      • FICHIER _JUIN_2025.xlsx     (%20_ / _)     ← defensive
+      • FICHIER_ JUIN_2025.xlsx     (_%20 / _)     ← defensive
 
-    We also try both upper-case and title-case month names because a handful
+    Compound separators (space+underscore or underscore+space) were confirmed
+    from the live URL: FICHIER%20_OCTOBRE%202023.xlsx
+
+    We also try both UPPER-case and Title-case month names because a handful
     of files have been spotted as "Juin" instead of "JUIN".
 
     Tried in order of likelihood so the most common pattern hits first,
     minimising unnecessary HTTP round-trips on the happy path.
     """
+    # s1 = separator between "FICHIER" and month name
+    # s2 = separator between month name and year
     separators = [
-        ('%20', '%20'),   # "FICHIER JUIN 2025"  ← most common
-        ('_',   '%20'),   # "FICHIER_JUIN 2025"
-        ('%20', '_'),     # "FICHIER JUIN_2025"
-        ('_',   '_'),     # "FICHIER_JUIN_2025"
+        ('%20',    '%20'),   # "FICHIER JUIN 2025"     ← most common
+        ('_',      '%20'),   # "FICHIER_JUIN 2025"
+        ('%20',    '_'),     # "FICHIER JUIN_2025"
+        ('_',      '_'),     # "FICHIER_JUIN_2025"
+        ('%20_',   '%20'),   # "FICHIER _OCTOBRE 2023" ← confirmed live URL
+        ('_%20',   '%20'),   # "FICHIER_ JUIN 2025"    ← mirror of above
+        ('%20_',   '_'),     # "FICHIER _JUIN_2025"
+        ('_%20',   '_'),     # "FICHIER_ JUIN_2025"
     ]
 
     month_variants = [
