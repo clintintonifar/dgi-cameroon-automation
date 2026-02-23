@@ -17,6 +17,11 @@
 #   uses files().update() to replace content IN-PLACE on every run,
 #   preserving the same file ID and public sharing link forever.
 #   Only uses files().create() on the very first upload.
+#
+# Naming-convention fix (v2):
+#   The DGI site uses inconsistent separators between FICHIER / MONTH / YEAR.
+#   build_candidate_urls() tries all 8 variants (4 separator combos × 2 cases)
+#   so files like FICHIER_MARS 2025.xlsx or FICHIER JUIN_2023.xlsx are found.
 # =============================================================================
 
 import os
@@ -73,7 +78,8 @@ PARQUET_SCHEMA = pa.schema([
     pa.field('CENTRE_DE_RATTACHEMENT', pa.string()),
 ])
 
-BASE_URL         = "https://teledeclaration-dgi.cm/UploadedFiles/AttachedFiles/ArchiveListecontribuable/FICHIER%20{}%20{}.xlsx"
+# Base URL — no separator baked in; build_candidate_urls() handles all variants
+BASE_HOST        = "https://teledeclaration-dgi.cm/UploadedFiles/AttachedFiles/ArchiveListecontribuable"
 DOWNLOAD_DIR     = "/tmp/dgi_downloads"
 COMBINED_PARQUET = "/tmp/dgi_downloads/DGI_COMBINED.parquet"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -98,6 +104,7 @@ def parse_filename_to_date(filename):
     except Exception:
         return None
 
+
 def get_month_list():
     """Generate list of (year, month) tuples for the last 60 months."""
     months = set()
@@ -109,23 +116,72 @@ def get_month_list():
     return list(months)
 
 # =============================================================================
+# URL CANDIDATE BUILDER — handles all known naming conventions
+# =============================================================================
+
+def build_candidate_urls(month_name: str, year: int) -> list:
+    """
+    Return every plausible URL for one month's file.
+
+    The DGI site has used at least four naming conventions over the years:
+      • FICHIER JUIN 2025.xlsx   (space  / space)   ← original / most common
+      • FICHIER_JUIN 2025.xlsx   (under  / space)
+      • FICHIER JUIN_2025.xlsx   (space  / under)
+      • FICHIER_JUIN_2025.xlsx   (under  / under)
+
+    We also try both upper-case and title-case month names because a handful
+    of files have been spotted as "Juin" instead of "JUIN".
+
+    Tried in order of likelihood so the most common pattern hits first,
+    minimising unnecessary HTTP round-trips on the happy path.
+    """
+    separators = [
+        ('%20', '%20'),   # "FICHIER JUIN 2025"  ← most common
+        ('_',   '%20'),   # "FICHIER_JUIN 2025"
+        ('%20', '_'),     # "FICHIER JUIN_2025"
+        ('_',   '_'),     # "FICHIER_JUIN_2025"
+    ]
+
+    month_variants = [
+        month_name,              # "JUIN"
+        month_name.capitalize(), # "Juin"
+    ]
+
+    urls = []
+    for mv in month_variants:
+        for s1, s2 in separators:
+            filename = f"FICHIER{s1}{mv}{s2}{year}.xlsx"
+            urls.append(f"{BASE_HOST}/{filename}")
+
+    return urls
+
+# =============================================================================
 # DOWNLOAD — PARALLEL WITH FAST TIMEOUT + RETRY
 # =============================================================================
 
 def download_file(year, month):
     """
-    Download one month's file. Returns (year, month, status).
-    Status: 'skipped' | 'downloaded' | 'not_found' | 'failed'
-    timeout=20 — fail fast and let retry logic handle it,
-                 rather than hanging for 60s per attempt.
+    Download one month's file, trying every naming-convention variant.
+
+    Returns (year, month, status) where status is one of:
+        'skipped'    — file already on disk, nothing to do
+        'downloaded' — fetched successfully from one of the URL variants
+        'not_found'  — all 8 URL patterns returned 404 after all retries
+        'failed'     — network / server error on every attempt
+
+    Two-level loop design:
+        Outer loop — iterates URL variants; breaks immediately on 404
+                     (no point retrying a URL that literally doesn't exist)
+        Inner loop — retries only for genuine network/server errors (5xx, timeouts)
     """
     month_name = FRENCH_MONTHS[month]
-    filename   = f"FICHIER_{month_name}_{year}.xlsx"
+    filename   = f"FICHIER_{month_name}_{year}.xlsx"   # canonical local name
     filepath   = os.path.join(DOWNLOAD_DIR, filename)
-    url        = BASE_URL.format(month_name, year)
 
     if os.path.exists(filepath):
         return year, month, 'skipped'
+
+    candidate_urls = build_candidate_urls(month_name, year)
 
     headers = {
         "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
@@ -135,30 +191,37 @@ def download_file(year, month):
         "Cache-Control":   "no-cache",
     }
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    last_status = 'not_found'
 
-            if response.status_code == 200:
-                with open(filepath, 'wb') as f:
-                    f.write(response.content)
-                return year, month, 'downloaded'
+    for url in candidate_urls:
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
 
-            elif response.status_code == 404:
+                if response.status_code == 200:
+                    # Save under canonical local name regardless of which URL
+                    # variant succeeded — keeps the rest of the pipeline simple.
+                    with open(filepath, 'wb') as f:
+                        f.write(response.content)
+                    return year, month, 'downloaded'
+
+                elif response.status_code == 404:
+                    # This URL variant doesn't exist — no point retrying it.
+                    last_status = 'not_found'
+                    break   # break inner retry loop → try next URL variant
+
+                else:
+                    # Unexpected server error — worth retrying same URL.
+                    last_status = 'failed'
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_DELAY + random.uniform(1, 3))
+
+            except Exception:
+                last_status = 'failed'
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY + random.uniform(1, 3))
-                else:
-                    return year, month, 'not_found'
-            else:
-                return year, month, 'failed'
 
-        except Exception:
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY + random.uniform(1, 3))
-            else:
-                return year, month, 'failed'
-
-    return year, month, 'failed'
+    return year, month, last_status
 
 
 def download_all_parallel(months_to_process):
