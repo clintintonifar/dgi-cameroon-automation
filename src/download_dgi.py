@@ -406,37 +406,16 @@ def list_drive_files(service, folder_id, mime_type=None):
     return files
 
 # =============================================================================
-# UPLOAD TO GOOGLE DRIVE
+# UPLOAD TO GOOGLE DRIVE — PARQUET ONLY
 # =============================================================================
 
-def upload_to_drive(service, drive_folder_id, newly_downloaded):
-    """Upload new xlsx files + refreshed Parquet to Google Drive."""
+def upload_to_drive(service, drive_folder_id):
+    """Upload only the combined Parquet file to Google Drive."""
     if not service:
         print("  ⚠️ No Drive service — skipping upload")
         return 0
 
     uploaded = 0
-
-    # Only upload individual xlsx files if new ones were downloaded this run
-    if newly_downloaded > 0:
-        for filename in os.listdir(DOWNLOAD_DIR):
-            if not filename.endswith('.xlsx'):
-                continue
-            try:
-                filepath = os.path.join(DOWNLOAD_DIR, filename)
-                service.files().create(
-                    body={'name': filename, 'parents': [drive_folder_id]},
-                    media_body=MediaFileUpload(
-                        filepath,
-                        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                    ),
-                    fields='id',
-                    supportsAllDrives=True,
-                ).execute()
-                print(f"  ✓ Uploaded: {filename}")
-                uploaded += 1
-            except Exception as e:
-                print(f"  ✗ Upload failed {filename}: {str(e)}")
 
     # Always replace the combined Parquet with the latest version
     if os.path.exists(COMBINED_PARQUET):
@@ -540,7 +519,7 @@ def main():
     # Step 4: Upload + cleanup
     if drive_service and DRIVE_FOLDER_ID:
         print("\n📤 Uploading to Google Drive...")
-        uploaded = upload_to_drive(drive_service, DRIVE_FOLDER_ID, newly_downloaded=downloaded)
+        uploaded = upload_to_drive(drive_service, DRIVE_FOLDER_ID)
         print(f"   Uploaded: {uploaded} files")
 
         print("\n🧹 Cleaning up files older than 5 years...")
