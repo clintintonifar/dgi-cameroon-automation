@@ -12,6 +12,11 @@
 #   [3] DOWNLOAD_WORKERS = 3 — optimal for GitHub Actions 2-core free runners
 #   [4] requests timeout = 20s — faster fail + retry, not 60s hanging
 #   [5] Drive list() with pagination — safe when folder grows large
+#
+# Drive upload strategy:
+#   uses files().update() to replace content IN-PLACE on every run,
+#   preserving the same file ID and public sharing link forever.
+#   Only uses files().create() on the very first upload.
 # =============================================================================
 
 import os
@@ -406,44 +411,83 @@ def list_drive_files(service, folder_id, mime_type=None):
     return files
 
 # =============================================================================
-# UPLOAD TO GOOGLE DRIVE — PARQUET ONLY
+# UPLOAD TO GOOGLE DRIVE — IN-PLACE UPDATE (PRESERVES FILE ID & PUBLIC LINK)
 # =============================================================================
 
 def upload_to_drive(service, drive_folder_id):
-    """Upload only the combined Parquet file to Google Drive."""
+    """
+    Upload the combined Parquet file to Google Drive.
+
+    Strategy:
+      - If the file already exists in Drive → use files().update() to replace
+        its content IN-PLACE. The file ID stays the same, so any public sharing
+        link shared previously will continue to work forever.
+      - If no file exists yet (first run) → use files().create() to create it.
+        After this first upload, share the link — it will never change again.
+
+    This replaces the old delete + create pattern which generated a new file ID
+    (and therefore a new link) on every single run.
+    """
     if not service:
         print("  ⚠️ No Drive service — skipping upload")
         return 0
 
+    if not os.path.exists(COMBINED_PARQUET):
+        print("  ⚠️ Parquet file not found — skipping upload")
+        return 0
+
     uploaded = 0
+    parquet_name = "DGI_COMBINED.parquet"
 
-    # Always replace the combined Parquet with the latest version
-    if os.path.exists(COMBINED_PARQUET):
-        try:
-            parquet_name = "DGI_COMBINED.parquet"
+    try:
+        # Find all files in the folder matching our target name
+        existing_files = [
+            f for f in list_drive_files(service, drive_folder_id)
+            if f['name'] == parquet_name
+        ]
 
-            # Delete all existing copies (handles duplicates gracefully)
-            for f in list_drive_files(service, drive_folder_id):
-                if f['name'] == parquet_name:
-                    service.files().delete(fileId=f['id'], supportsAllDrives=True).execute()
-                    print(f"  🗑 Removed old {parquet_name} from Drive")
+        media = MediaFileUpload(
+            COMBINED_PARQUET,
+            mimetype='application/octet-stream',
+            resumable=True,   # Avoids silent timeout failures for large files
+        )
 
-            # Upload with resumable=True — avoids silent timeout for large files
+        if existing_files:
+            # ✅ FILE ALREADY EXISTS — update content in-place
+            # files().update() replaces the bytes but keeps the same file ID,
+            # so all previously shared public links remain valid.
+            existing_id = existing_files[0]['id']
+
+            # If duplicates somehow exist, clean them up first
+            for duplicate in existing_files[1:]:
+                service.files().delete(
+                    fileId=duplicate['id'],
+                    supportsAllDrives=True,
+                ).execute()
+                print(f"  🗑 Removed duplicate copy (ID: {duplicate['id']})")
+
+            service.files().update(
+                fileId=existing_id,
+                media_body=media,
+                supportsAllDrives=True,
+            ).execute()
+            print(f"  ✓ Updated in-place: {parquet_name} (file ID & public link preserved ✅)")
+
+        else:
+            # 🆕 FIRST RUN — file does not exist yet, create it
             service.files().create(
                 body={'name': parquet_name, 'parents': [drive_folder_id]},
-                media_body=MediaFileUpload(
-                    COMBINED_PARQUET,
-                    mimetype='application/octet-stream',
-                    resumable=True,
-                ),
+                media_body=media,
                 fields='id',
                 supportsAllDrives=True,
             ).execute()
-            print(f"  ✓ Uploaded: {parquet_name}")
-            uploaded += 1
+            print(f"  ✓ Created new: {parquet_name} (first upload)")
+            print(f"  ℹ️  Share this file's public link now — it will never change on future runs.")
 
-        except Exception as e:
-            print(f"  ✗ Upload failed for Parquet: {str(e)}")
+        uploaded = 1
+
+    except Exception as e:
+        print(f"  ✗ Upload failed for Parquet: {str(e)}")
 
     return uploaded
 
