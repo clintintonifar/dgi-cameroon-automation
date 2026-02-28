@@ -1,51 +1,158 @@
 # =============================================================================
-# DGI Cameroon - Daily Automated Downloader
-# Runs EVERY DAY at 03:00 UTC
+# DGI Cameroon - Smart Monthly Downloader (Sentinel Edition)
+#
+# Schedule: 4 targeted attempts per month on days 2, 5, 10, and 15.
+#
+# How the sentinel cancellation works:
+#   1. After a successful download, the Python script writes the downloaded
+#      month (e.g. "2026-01") to last_downloaded.txt in the repo root.
+#   2. The workflow immediately commits and pushes that file back to the repo.
+#   3. On every subsequent run, the YAML reads last_downloaded.txt BEFORE
+#      installing Python or dependencies. If it already contains this month's
+#      key, the entire job is skipped in ~5 seconds — zero Python overhead.
+#   4. The Python script also re-checks internally as a safety net.
+#
+# Example for February 2026 (expected file = January 2026 = key "2026-01"):
+#   Day  2 → sentinel empty       → probes DGI → not found → no update, retry
+#   Day  5 → sentinel empty       → probes DGI → FOUND     → downloads, writes "2026-01" → commits
+#   Day 10 → sentinel = "2026-01" → SKIP in 5 seconds ✅
+#   Day 15 → sentinel = "2026-01" → SKIP in 5 seconds ✅
+#
+# Required GitHub Secrets:
+#   Google Drive:  DRIVE_FOLDER_ID, GOOGLE_REFRESH_TOKEN, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+#   Email:         SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, NOTIFY_EMAIL
+#
+# One-time repo setting required:
+#   Settings → Actions → General → Workflow permissions → Read and write permissions ✅
 # =============================================================================
 
 name: DGI Monthly Downloader
 
 on:
   schedule:
-    # Cron syntax: Minute Hour Day Month DayOfWeek
-    # Runs at 03:00 UTC EVERY DAY (catches late DGI uploads)
-    - cron: '0 3 * * *'
-  
-  # Allow manual trigger for testing
+    # Day 2:  First attempt — catches early DGI publishers (most common)
+    - cron: '0 3 2 * *'
+    # Day 5:  Second attempt — catches slightly delayed publishers
+    - cron: '0 3 5 * *'
+    # Day 10: Third attempt — catches late publishers / DGI delays
+    - cron: '0 3 10 * *'
+    # Day 15: Final safety net — if DGI still hasn't published by day 15,
+    #         something unusual is happening; email will alert you.
+    - cron: '0 3 15 * *'
+
+  # Manual trigger — useful for testing, backfilling, or re-running after an error
   workflow_dispatch:
 
 jobs:
   download:
     runs-on: ubuntu-latest
-    
+
     steps:
-    # Step 1: Checkout repository code
+    # ------------------------------------------------------------------
+    # Step 1: Checkout repository
+    # ------------------------------------------------------------------
     - name: Checkout code
       uses: actions/checkout@v4
 
-    # Step 2: Setup Python environment
+    # ------------------------------------------------------------------
+    # Step 2: Sentinel check — read last_downloaded.txt and compute the
+    # expected month key (YYYY-MM of last month). If they match, cancel
+    # the entire job immediately — before Python even installs.
+    # This is the primary cost-saving gate: ~5 seconds vs ~5 minutes.
+    # ------------------------------------------------------------------
+    - name: Check sentinel — skip if already downloaded this month
+      id: sentinel
+      run: |
+        # Compute the expected month key: year-month of the PREVIOUS calendar month
+        # e.g. if today is 2026-02-05, expected key = "2026-01"
+        EXPECTED_KEY=$(python3 -c "
+        from datetime import datetime
+        now = datetime.now()
+        y, m = (now.year, now.month - 1) if now.month > 1 else (now.year - 1, 12)
+        print(f'{y}-{m:02d}')
+        ")
+        echo "Expected sentinel key: $EXPECTED_KEY"
+
+        # Read current sentinel value (empty string if file doesn't exist)
+        CURRENT=""
+        if [ -f last_downloaded.txt ]; then
+          CURRENT=$(cat last_downloaded.txt | tr -d '[:space:]')
+        fi
+        echo "Current sentinel value: '$CURRENT'"
+
+        if [ "$CURRENT" = "$EXPECTED_KEY" ]; then
+          echo "✅ Already downloaded $EXPECTED_KEY — skipping this run."
+          echo "skip=true" >> $GITHUB_OUTPUT
+        else
+          echo "🔄 Sentinel mismatch — proceeding with pipeline."
+          echo "skip=false" >> $GITHUB_OUTPUT
+        fi
+
+    # ------------------------------------------------------------------
+    # Step 3: Setup Python — only runs if sentinel said "proceed"
+    # ------------------------------------------------------------------
     - name: Setup Python
+      if: steps.sentinel.outputs.skip == 'false'
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
-    # Step 3: Install Python dependencies
+    # ------------------------------------------------------------------
+    # Step 4: Install dependencies — only runs if sentinel said "proceed"
+    # ------------------------------------------------------------------
     - name: Install dependencies
+      if: steps.sentinel.outputs.skip == 'false'
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    # Step 4: Run the DGI downloader script
+    # ------------------------------------------------------------------
+    # Step 5: Run the DGI downloader script
+    # The script probes the DGI site first. If the file isn't live yet,
+    # it exits cleanly (sends a warning email) without touching Drive.
+    # On success, it writes last_downloaded.txt before exiting.
+    # ------------------------------------------------------------------
     - name: Run DGI Downloader
+      if: steps.sentinel.outputs.skip == 'false'
       env:
-        # 🔹 PASS THE CORRECT SECRET NAMES TO THE SCRIPT 🔹
-        DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+        # Google Drive credentials
+        DRIVE_FOLDER_ID:      ${{ secrets.DRIVE_FOLDER_ID }}
         GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-        GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+        GOOGLE_CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
         GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        # Email notification credentials
+        SMTP_HOST:            ${{ secrets.SMTP_HOST }}
+        SMTP_PORT:            ${{ secrets.SMTP_PORT }}
+        SMTP_USER:            ${{ secrets.SMTP_USER }}
+        SMTP_PASSWORD:        ${{ secrets.SMTP_PASSWORD }}
+        NOTIFY_EMAIL:         ${{ secrets.NOTIFY_EMAIL }}
       run: python src/download_dgi.py
 
-    # Step 5: Upload logs as artifact (for debugging if needed)
+    # ------------------------------------------------------------------
+    # Step 6: Commit sentinel file back to repo
+    # Only runs if the downloader script actually wrote last_downloaded.txt
+    # (meaning a successful download happened this run).
+    # This committed file is what future runs read in Step 2 to self-cancel.
+    # ------------------------------------------------------------------
+    - name: Commit sentinel file
+      if: steps.sentinel.outputs.skip == 'false'
+      run: |
+        # Only commit if last_downloaded.txt was actually modified or created
+        if git diff --quiet last_downloaded.txt 2>/dev/null && \
+           git ls-files --error-unmatch last_downloaded.txt 2>/dev/null; then
+          echo "ℹ️  Sentinel file unchanged — nothing to commit."
+        else
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_downloaded.txt
+          git commit -m "chore: update sentinel after successful DGI download [skip ci]"
+          git push
+          echo "✅ Sentinel committed and pushed."
+        fi
+
+    # ------------------------------------------------------------------
+    # Step 7: Upload logs as artifact (always runs, useful for debugging)
+    # ------------------------------------------------------------------
     - name: Upload download logs
       if: always()
       uses: actions/upload-artifact@v4
