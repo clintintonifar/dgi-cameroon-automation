@@ -1,6 +1,7 @@
 # =============================================================================
 # DGI Cameroon - GitHub Actions Automation (OAuth Version)
-# Rolling 5-Year Window: Always keep last 60 months of data
+# Rolling 5-Year Window: Always keep last 5 full years of data
+# The first year is always COMPLETE (starts at January of current_year - 5)
 # Output: DGI_COMBINED.parquet (~300-500MB vs 1.5GB CSV)
 # Uses OAuth Refresh Token (Personal Account Quota)
 # ALL credentials loaded from GitHub Secrets (environment variables)
@@ -42,7 +43,6 @@ import random
 # CONFIGURATION
 # =============================================================================
 YEARS_TO_KEEP      = 5
-MONTHS_TO_DOWNLOAD = YEARS_TO_KEEP * 12
 DOWNLOAD_WORKERS   = 3     # Optimal for GitHub Actions 2-core free runners
 MAX_RETRIES        = 5
 RETRY_DELAY        = 5
@@ -107,14 +107,25 @@ def parse_filename_to_date(filename):
 
 
 def get_month_list():
-    """Generate list of (year, month) tuples for the last 60 months."""
-    months = set()
-    current = datetime.now().replace(day=1)
-    for i in range(MONTHS_TO_DOWNLOAD):
-        target = current - timedelta(days=30 * i)
-        if target <= datetime.now():
-            months.add((target.year, target.month))
-    return list(months)
+    """
+    Generate list of (year, month) tuples covering a full 5-year window.
+    The first year is always COMPLETE — starts at January of (current_year - 5),
+    not at the current month 60 months ago.
+    e.g. running in Feb 2026 → starts Jan 2021, not Mar 2021.
+    """
+    now = datetime.now()
+    start_year  = now.year - YEARS_TO_KEEP
+    start_month = 1   # Always January — ensures first year is complete
+
+    months = []
+    year, month = start_year, start_month
+    while (year, month) <= (now.year, now.month):
+        months.append((year, month))
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    return months
 
 # =============================================================================
 # URL CANDIDATE BUILDER — handles all known naming conventions
@@ -621,8 +632,12 @@ def main():
 
     DRIVE_FOLDER_ID = os.environ.get('DRIVE_FOLDER_ID', '')
 
-    cutoff_date = datetime.now() - timedelta(days=YEARS_TO_KEEP * 365)
-    print(f"📅 Data window: {cutoff_date.strftime('%Y-%m')} → {datetime.now().strftime('%Y-%m')}")
+    # Cutoff date = January 1st of (current_year - 5)
+    # This ensures the first year in the window is always complete.
+    # e.g. running in Feb 2026 → cutoff is Jan 1 2021 (not Mar 2021)
+    now = datetime.now()
+    cutoff_date = datetime(now.year - YEARS_TO_KEEP, 1, 1)
+    print(f"📅 Data window: {cutoff_date.strftime('%Y-%m')} → {now.strftime('%Y-%m')}")
 
     months_to_process = get_month_list()
     print(f"📊 Will process {len(months_to_process)} months")
