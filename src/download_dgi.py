@@ -22,29 +22,16 @@
 # Naming-convention fix (v3):
 #   The DGI site uses inconsistent separators between FICHIER / MONTH / YEAR.
 #   build_candidate_urls() tries all 16 variants (8 separator combos × 2 cases).
-#
-# Smart sentinel check (v5):
-#   After a successful download, writes last_downloaded.txt to the repo root
-#   (committed by the workflow via git). On the next scheduled run, the YAML
-#   checks this file BEFORE installing Python — if the current expected month
-#   is already recorded, the job is cancelled in ~5 seconds at zero cost.
-#   The Python script also re-checks internally as a safety net.
-#
-# Email notifications (v4):
-#   Sends a summary email (to NOTIFY_EMAIL) via SMTP after every run.
-#   Supports Gmail (smtp.gmail.com:587) and Outlook (smtp.office365.com:587).
+#   Covers simple separators (_  space) AND compound ones (space+_ or _+space),
+#   e.g. FICHIER _OCTOBRE 2023.xlsx (confirmed live URL: FICHIER%20_OCTOBRE%202023).
 # =============================================================================
 
 import os
-import sys
 import time
-import smtplib
 import requests
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from google.oauth2.credentials import Credentials
@@ -56,17 +43,10 @@ import random
 # CONFIGURATION
 # =============================================================================
 YEARS_TO_KEEP      = 5
-DOWNLOAD_WORKERS   = 3
+DOWNLOAD_WORKERS   = 3     # Optimal for GitHub Actions 2-core free runners
 MAX_RETRIES        = 5
 RETRY_DELAY        = 5
-REQUEST_TIMEOUT    = 20
-
-# Path to the sentinel file — committed to repo root by the workflow after
-# a successful download so subsequent runs in the same month skip instantly.
-SENTINEL_FILE = os.path.join(
-    os.environ.get('GITHUB_WORKSPACE', '.'),
-    'last_downloaded.txt'
-)
+REQUEST_TIMEOUT    = 20    # Faster fail-and-retry instead of 60s hang
 
 FRENCH_MONTHS = {
     1: 'JANVIER', 2: 'FEVRIER', 3: 'MARS', 4: 'AVRIL',
@@ -74,11 +54,19 @@ FRENCH_MONTHS = {
     9: 'SEPTEMBRE', 10: 'OCTOBRE', 11: 'NOVEMBRE', 12: 'DECEMBRE'
 }
 
+# Canonical columns present in both old and new file formats.
+# Old files had ~21 cols — legacy-only ones are silently dropped.
 CANONICAL_COLUMNS = [
-    'RAISON_SOCIALE', 'SIGLE', 'NIU', 'ACTIVITE_PRINCIPALE',
-    'REGIME', 'CRI', 'CENTRE_DE_RATTACHEMENT',
+    'RAISON_SOCIALE',
+    'SIGLE',
+    'NIU',
+    'ACTIVITE_PRINCIPALE',
+    'REGIME',
+    'CRI',
+    'CENTRE_DE_RATTACHEMENT',
 ]
 
+# PyArrow schema — enforces types at write time, makes Parquet tighter
 PARQUET_SCHEMA = pa.schema([
     pa.field('YEAR',                   pa.int16()),
     pa.field('MONTH',                  pa.int16()),
@@ -91,118 +79,11 @@ PARQUET_SCHEMA = pa.schema([
     pa.field('CENTRE_DE_RATTACHEMENT', pa.string()),
 ])
 
+# Base URL — no separator baked in; build_candidate_urls() handles all variants
 BASE_HOST        = "https://teledeclaration-dgi.cm/UploadedFiles/AttachedFiles/ArchiveListecontribuable"
 DOWNLOAD_DIR     = "/tmp/dgi_downloads"
 COMBINED_PARQUET = "/tmp/dgi_downloads/DGI_COMBINED.parquet"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-# =============================================================================
-# SENTINEL FILE — tracks the last successfully downloaded month
-# =============================================================================
-
-def get_expected_latest_month() -> tuple:
-    """
-    Return (year, month) of the most recent file that should exist on DGI.
-    DGI publishes month M data during month M+1, so expected latest = previous month.
-    e.g. running in February 2026 → expected latest = January 2026
-    """
-    now = datetime.now()
-    if now.month == 1:
-        return (now.year - 1, 12)
-    return (now.year, now.month - 1)
-
-
-def sentinel_month_key(year: int, month: int) -> str:
-    """Canonical string stored in sentinel file — e.g. '2026-01'"""
-    return f"{year}-{month:02d}"
-
-
-def read_sentinel() -> str:
-    """Read sentinel file. Returns empty string if it doesn't exist."""
-    if os.path.exists(SENTINEL_FILE):
-        with open(SENTINEL_FILE, 'r') as f:
-            return f.read().strip()
-    return ''
-
-
-def write_sentinel(year: int, month: int):
-    """
-    Write successfully-downloaded month to the sentinel file.
-    The workflow's git commit step pushes this back to the repo so the
-    next scheduled run sees it immediately and exits in ~5 seconds.
-    """
-    key = sentinel_month_key(year, month)
-    with open(SENTINEL_FILE, 'w') as f:
-        f.write(key + '\n')
-    print(f"  📝 Sentinel written: {SENTINEL_FILE} → '{key}'")
-
-
-def sentinel_already_downloaded() -> bool:
-    """True if sentinel already records the current expected month."""
-    expected_year, expected_month = get_expected_latest_month()
-    expected_key = sentinel_month_key(expected_year, expected_month)
-    return read_sentinel() == expected_key
-
-# =============================================================================
-# EMAIL NOTIFICATION
-# =============================================================================
-
-def send_email_notification(subject: str, body: str, status: str = "info"):
-    """
-    Send a run summary email via SMTP.
-
-    Required GitHub Secrets → env vars:
-        SMTP_HOST      — smtp.gmail.com  OR  smtp.office365.com
-        SMTP_PORT      — 587 (STARTTLS)
-        SMTP_USER      — your full email address (sender)
-        SMTP_PASSWORD  — Gmail App Password or Outlook password
-        NOTIFY_EMAIL   — recipient address (can be same as SMTP_USER)
-    """
-    smtp_host = os.environ.get('SMTP_HOST', '')
-    smtp_port = int(os.environ.get('SMTP_PORT', '587'))
-    smtp_user = os.environ.get('SMTP_USER', '')
-    smtp_pass = os.environ.get('SMTP_PASSWORD', '')
-    notify_to = os.environ.get('NOTIFY_EMAIL', smtp_user)
-
-    if not all([smtp_host, smtp_user, smtp_pass, notify_to]):
-        print("  ⚠️  Email config incomplete — skipping notification")
-        print("      Set SMTP_HOST, SMTP_USER, SMTP_PASSWORD, NOTIFY_EMAIL secrets.")
-        return
-
-    emoji = {'success': '✅', 'warning': '⚠️', 'error': '❌'}.get(status, 'ℹ️')
-    full_subject = f"{emoji} DGI Cameroon Pipeline — {subject}"
-
-    html_body = f"""
-    <html><body style="font-family: monospace; font-size: 13px; color: #222;">
-    <h2 style="color: {'#2a7a2a' if status == 'success' else '#c0392b' if status == 'error' else '#e67e22'};">
-        {emoji} DGI Cameroon Pipeline Report
-    </h2>
-    <pre style="background:#f4f4f4; padding:16px; border-radius:6px; white-space:pre-wrap;">{body}</pre>
-    <hr/>
-    <small style="color:#888;">
-        Sent automatically by the DGI GitHub Actions pipeline.<br/>
-        Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
-    </small>
-    </body></html>
-    """
-
-    msg = MIMEMultipart('alternative')
-    msg['Subject'] = full_subject
-    msg['From']    = smtp_user
-    msg['To']      = notify_to
-    msg.attach(MIMEText(body,      'plain'))
-    msg.attach(MIMEText(html_body, 'html'))
-
-    try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_user, notify_to, msg.as_string())
-        print(f"  📧 Notification sent → {notify_to}")
-    except Exception as e:
-        print(f"  ⚠️  Email send failed: {e}")
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -225,54 +106,20 @@ def parse_filename_to_date(filename):
         return None
 
 
-def probe_latest_file_available() -> bool:
-    """
-    Probe the DGI website to confirm the expected latest file is published.
-    Uses HEAD requests (zero bandwidth) across all URL variants.
-    Returns True if any variant returns HTTP 200.
-    """
-    expected_year, expected_month = get_expected_latest_month()
-    month_name = FRENCH_MONTHS[expected_month]
-
-    print(f"\n🔍 Probing DGI site for: FICHIER_*{month_name}*{expected_year}.xlsx ...")
-
-    candidate_urls = build_candidate_urls(month_name, expected_year)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    }
-
-    for url in candidate_urls:
-        try:
-            resp = requests.head(url, headers=headers, timeout=REQUEST_TIMEOUT,
-                                 allow_redirects=True)
-            if resp.status_code == 200:
-                print(f"  ✅ File confirmed available at: {url}")
-                return True
-            if resp.status_code == 405:
-                resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, stream=True)
-                resp.close()
-                if resp.status_code == 200:
-                    print(f"  ✅ File confirmed available at: {url}")
-                    return True
-        except Exception:
-            continue
-
-    print(f"  ℹ️  {month_name} {expected_year} not yet published on DGI site.")
-    return False
-
-
 def get_month_list():
     """
-    Generate (year, month) tuples for the full 5-year window.
-    Upper bound = previous month (current month's data isn't published yet).
+    Generate list of (year, month) tuples covering a full 5-year window.
+    The first year is always COMPLETE — starts at January of (current_year - 5),
+    not at the current month 60 months ago.
+    e.g. running in Feb 2026 → starts Jan 2021, not Mar 2021.
     """
     now = datetime.now()
-    start_year, start_month = now.year - YEARS_TO_KEEP, 1
-    end_year, end_month = get_expected_latest_month()
+    start_year  = now.year - YEARS_TO_KEEP
+    start_month = 1   # Always January — ensures first year is complete
 
     months = []
     year, month = start_year, start_month
-    while (year, month) <= (end_year, end_month):
+    while (year, month) <= (now.year, now.month):
         months.append((year, month))
         month += 1
         if month > 12:
@@ -281,35 +128,86 @@ def get_month_list():
     return months
 
 # =============================================================================
-# URL CANDIDATE BUILDER
+# URL CANDIDATE BUILDER — handles all known naming conventions
 # =============================================================================
 
 def build_candidate_urls(month_name: str, year: int) -> list:
-    """Return every plausible URL variant for one month's file."""
+    """
+    Return every plausible URL for one month's file.
+
+    Confirmed naming conventions found on the DGI site so far:
+      • FICHIER JUIN 2025.xlsx      (%20  / %20)   ← most common
+      • FICHIER_JUIN 2025.xlsx      (_    / %20)
+      • FICHIER JUIN_2025.xlsx      (%20  / _)
+      • FICHIER_JUIN_2025.xlsx      (_    / _)
+      • FICHIER _OCTOBRE 2023.xlsx  (%20_ / %20)   ← confirmed Oct 2023
+      • FICHIER_ JUIN 2025.xlsx     (_%20 / %20)   ← defensive mirror
+      • FICHIER _JUIN_2025.xlsx     (%20_ / _)     ← defensive
+      • FICHIER_ JUIN_2025.xlsx     (_%20 / _)     ← defensive
+
+    Compound separators (space+underscore or underscore+space) were confirmed
+    from the live URL: FICHIER%20_OCTOBRE%202023.xlsx
+
+    We also try both UPPER-case and Title-case month names because a handful
+    of files have been spotted as "Juin" instead of "JUIN".
+
+    Tried in order of likelihood so the most common pattern hits first,
+    minimising unnecessary HTTP round-trips on the happy path.
+    """
+    # s1 = separator between "FICHIER" and month name
+    # s2 = separator between month name and year
     separators = [
-        ('%20',  '%20'), ('_',    '%20'), ('%20',  '_'),   ('_',    '_'),
-        ('%20_', '%20'), ('_%20', '%20'), ('%20_', '_'),   ('_%20', '_'),
+        ('%20',    '%20'),   # "FICHIER JUIN 2025"     ← most common
+        ('_',      '%20'),   # "FICHIER_JUIN 2025"
+        ('%20',    '_'),     # "FICHIER JUIN_2025"
+        ('_',      '_'),     # "FICHIER_JUIN_2025"
+        ('%20_',   '%20'),   # "FICHIER _OCTOBRE 2023" ← confirmed live URL
+        ('_%20',   '%20'),   # "FICHIER_ JUIN 2025"    ← mirror of above
+        ('%20_',   '_'),     # "FICHIER _JUIN_2025"
+        ('_%20',   '_'),     # "FICHIER_ JUIN_2025"
     ]
-    month_variants = [month_name, month_name.capitalize()]
+
+    month_variants = [
+        month_name,              # "JUIN"
+        month_name.capitalize(), # "Juin"
+    ]
+
     urls = []
     for mv in month_variants:
         for s1, s2 in separators:
-            urls.append(f"{BASE_HOST}/FICHIER{s1}{mv}{s2}{year}.xlsx")
+            filename = f"FICHIER{s1}{mv}{s2}{year}.xlsx"
+            urls.append(f"{BASE_HOST}/{filename}")
+
     return urls
 
 # =============================================================================
-# DOWNLOAD
+# DOWNLOAD — PARALLEL WITH FAST TIMEOUT + RETRY
 # =============================================================================
 
 def download_file(year, month):
+    """
+    Download one month's file, trying every naming-convention variant.
+
+    Returns (year, month, status) where status is one of:
+        'skipped'    — file already on disk, nothing to do
+        'downloaded' — fetched successfully from one of the URL variants
+        'not_found'  — all 8 URL patterns returned 404 after all retries
+        'failed'     — network / server error on every attempt
+
+    Two-level loop design:
+        Outer loop — iterates URL variants; breaks immediately on 404
+                     (no point retrying a URL that literally doesn't exist)
+        Inner loop — retries only for genuine network/server errors (5xx, timeouts)
+    """
     month_name = FRENCH_MONTHS[month]
-    filename   = f"FICHIER_{month_name}_{year}.xlsx"
+    filename   = f"FICHIER_{month_name}_{year}.xlsx"   # canonical local name
     filepath   = os.path.join(DOWNLOAD_DIR, filename)
 
     if os.path.exists(filepath):
         return year, month, 'skipped'
 
     candidate_urls = build_candidate_urls(month_name, year)
+
     headers = {
         "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
         "Accept":          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/octet-stream, */*",
@@ -317,23 +215,32 @@ def download_file(year, month):
         "Connection":      "keep-alive",
         "Cache-Control":   "no-cache",
     }
+
     last_status = 'not_found'
 
     for url in candidate_urls:
         for attempt in range(MAX_RETRIES):
             try:
                 response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+
                 if response.status_code == 200:
+                    # Save under canonical local name regardless of which URL
+                    # variant succeeded — keeps the rest of the pipeline simple.
                     with open(filepath, 'wb') as f:
                         f.write(response.content)
                     return year, month, 'downloaded'
+
                 elif response.status_code == 404:
+                    # This URL variant doesn't exist — no point retrying it.
                     last_status = 'not_found'
-                    break
+                    break   # break inner retry loop → try next URL variant
+
                 else:
+                    # Unexpected server error — worth retrying same URL.
                     last_status = 'failed'
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(RETRY_DELAY + random.uniform(1, 3))
+
             except Exception:
                 last_status = 'failed'
                 if attempt < MAX_RETRIES - 1:
@@ -343,8 +250,12 @@ def download_file(year, month):
 
 
 def download_all_parallel(months_to_process):
+    """
+    Download all months using a thread pool.
+    DOWNLOAD_WORKERS=3 is optimal for GitHub Actions free tier (2 cores).
+    More threads cause context-switching overhead and net slower performance.
+    """
     downloaded = skipped = failed = 0
-    failed_files = []
     total = len(months_to_process)
 
     print(f"\n📥 Downloading {total} months ({DOWNLOAD_WORKERS} parallel threads)...")
@@ -369,40 +280,70 @@ def download_all_parallel(months_to_process):
                 print(f"{label} → Skip: FICHIER_{month_name}_{year}.xlsx (exists)")
             elif status == 'not_found':
                 failed += 1
-                failed_files.append(f"FICHIER_{month_name}_{year}.xlsx (not found)")
                 print(f"{label} ⚠ Not found: FICHIER_{month_name}_{year}.xlsx")
             else:
                 failed += 1
-                failed_files.append(f"FICHIER_{month_name}_{year}.xlsx (error)")
                 print(f"{label} ✗ Failed: FICHIER_{month_name}_{year}.xlsx")
 
-    return downloaded, skipped, failed, failed_files
+    return downloaded, skipped, failed
 
 # =============================================================================
 # COLUMN NORMALIZATION
 # =============================================================================
 
 def normalize_to_arrow_table(df, year, month):
+    """
+    Normalize a raw Excel DataFrame and convert directly to a PyArrow Table.
+    Returning an Arrow Table instead of a pandas DataFrame avoids a redundant
+    pandas→arrow conversion inside the ParquetWriter, saving time and memory.
+    """
+    # Normalize column names
     df.columns = [str(c).strip().upper() for c in df.columns]
+
+    # Drop legacy row-number index columns from old format
     for drop_col in ['N°', 'N', 'Nº']:
         if drop_col in df.columns:
             df.drop(columns=[drop_col], inplace=True)
+
+    # Add any missing canonical columns as empty strings
     for col in CANONICAL_COLUMNS:
         if col not in df.columns:
             df[col] = ''
+
     df = df[CANONICAL_COLUMNS].copy()
+
+    # Clean string values
     for col in CANONICAL_COLUMNS:
         df[col] = df[col].astype(str).str.strip().replace('nan', '')
+
+    # Inject period columns
     n = len(df)
     df.insert(0, 'MONTH', pd.array([month] * n, dtype='int16'))
     df.insert(0, 'YEAR',  pd.array([year]  * n, dtype='int16'))
+
+    # Convert directly to PyArrow Table with enforced schema
     return pa.Table.from_pandas(df, schema=PARQUET_SCHEMA, preserve_index=False)
 
 # =============================================================================
-# COMBINE — INCREMENTAL PARQUET STREAMING
+# COMBINE — INCREMENTAL PARQUET STREAMING (NO MEMORY SPIKE)
 # =============================================================================
 
 def combine_to_parquet(newly_downloaded):
+    """
+    Stream each Excel file through normalization and write it immediately
+    to Parquet using PyArrow's ParquetWriter.
+
+    Pattern:
+        Excel → normalize → Arrow Table → ParquetWriter.write_table()
+                                          (appends to same file, row group by row group)
+
+    This replaces the old pattern:
+        Excel → DataFrame → all_frames.append() → pd.concat() → to_parquet()
+    which held ALL data in RAM before writing anything.
+
+    The new pattern holds only ONE file in memory at a time — safe at any scale.
+    Skips full rebuild when no new files were downloaded.
+    """
     if newly_downloaded == 0 and os.path.exists(COMBINED_PARQUET):
         size_mb = os.path.getsize(COMBINED_PARQUET) / 1024 / 1024
         print(f"\n📊 No new files — reusing existing Parquet ({size_mb:.1f} MB)")
@@ -419,6 +360,7 @@ def combine_to_parquet(newly_downloaded):
         print("  ⚠️ No Excel files found to combine.")
         return None
 
+    # Prefer calamine (Rust, 3-6x faster), fall back to openpyxl
     try:
         import python_calamine  # noqa: F401
         excel_engine = 'calamine'
@@ -429,26 +371,49 @@ def combine_to_parquet(newly_downloaded):
 
     total_rows = 0
 
+    # ParquetWriter opens the file once and appends one Arrow Table per Excel file.
+    # snappy compression: best balance of speed vs size for this workload.
+    # row_group_size=100_000: each Excel file becomes one row group — efficient
+    # for Power BI which can skip row groups during predicate pushdown.
     with pq.ParquetWriter(
-        COMBINED_PARQUET, schema=PARQUET_SCHEMA,
-        compression='snappy', use_dictionary=True, write_statistics=True,
+        COMBINED_PARQUET,
+        schema=PARQUET_SCHEMA,
+        compression='snappy',
+        use_dictionary=True,       # Dictionary-encodes repetitive strings (REGIME, CRI, etc.)
+        write_statistics=True,     # Enables min/max stats per column — speeds up Power BI filters
     ) as writer:
+
         for i, filename in enumerate(xlsx_files, 1):
             parsed = parse_filename_to_date(filename)
             if parsed is None:
                 print(f"  ⚠ Skipping (unparseable name): {filename}")
                 continue
+
             year, month = parsed
             filepath = os.path.join(DOWNLOAD_DIR, filename)
+
             try:
-                df = pd.read_excel(filepath, sheet_name=0, dtype=str, engine=excel_engine)
+                # Read Excel — calamine is 3-6x faster than openpyxl here
+                df = pd.read_excel(
+                    filepath,
+                    sheet_name=0,
+                    dtype=str,
+                    engine=excel_engine,
+                )
                 df.dropna(how='all', inplace=True)
+
+                # Normalize + convert to Arrow Table in one step
                 arrow_table = normalize_to_arrow_table(df, year, month)
+
+                # Write this file's rows immediately — no accumulation in RAM
                 writer.write_table(arrow_table, row_group_size=100_000)
+
                 total_rows += len(arrow_table)
                 print(f"  [{i}/{len(xlsx_files)}] ✓ {filename} — {len(arrow_table):,} rows")
+
             except Exception as e:
                 print(f"  [{i}/{len(xlsx_files)}] ✗ Failed: {filename} — {str(e)}")
+                continue
 
     if total_rows == 0:
         print("  ✗ No data written.")
@@ -457,13 +422,15 @@ def combine_to_parquet(newly_downloaded):
 
     size_mb = os.path.getsize(COMBINED_PARQUET) / 1024 / 1024
     print(f"\n  ✅ Parquet ready: {total_rows:,} rows, {size_mb:.1f} MB")
+
     return COMBINED_PARQUET
 
 # =============================================================================
-# GOOGLE DRIVE
+# GOOGLE DRIVE AUTHENTICATION
 # =============================================================================
 
 def authenticate_drive():
+    """Authenticate using OAuth Refresh Token."""
     try:
         print("  🔍 Checking env vars:")
         for var in ['GOOGLE_REFRESH_TOKEN', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET']:
@@ -479,93 +446,178 @@ def authenticate_drive():
             return None
 
         creds = Credentials(
-            None, refresh_token=refresh_token,
+            None,
+            refresh_token=refresh_token,
             token_uri="https://oauth2.googleapis.com/token",
-            client_id=client_id, client_secret=client_secret,
+            client_id=client_id,
+            client_secret=client_secret,
             scopes=['https://www.googleapis.com/auth/drive'],
         )
+
         service = build('drive', 'v3', credentials=creds)
         print("  ✅ Google Drive authenticated via OAuth")
         return service
+
     except Exception as e:
         print(f"  ⚠️ Drive auth failed: {str(e)}")
         return None
 
+# =============================================================================
+# DRIVE — LIST FILES WITH PAGINATION (safe for large folders)
+# =============================================================================
 
 def list_drive_files(service, folder_id, mime_type=None):
+    """
+    List all files in a Drive folder, following pagination tokens.
+    Without pagination, files().list() only returns the first page (~100 files).
+    As the folder grows past 100 files, old files would silently escape cleanup.
+    """
     query = f"'{folder_id}' in parents"
     if mime_type:
         query += f" and mimeType='{mime_type}'"
-    files, page_token = [], None
+
+    files = []
+    page_token = None
+
     while True:
         kwargs = {
-            'q': query, 'fields': 'nextPageToken, files(id, name)',
-            'supportsAllDrives': True, 'pageSize': 1000,
+            'q':               query,
+            'fields':          'nextPageToken, files(id, name)',
+            'supportsAllDrives': True,
+            'pageSize':        1000,   # Max allowed per page
         }
         if page_token:
             kwargs['pageToken'] = page_token
+
         result     = service.files().list(**kwargs).execute()
         files     += result.get('files', [])
         page_token = result.get('nextPageToken')
+
         if not page_token:
             break
+
     return files
 
+# =============================================================================
+# UPLOAD TO GOOGLE DRIVE — IN-PLACE UPDATE (PRESERVES FILE ID & PUBLIC LINK)
+# =============================================================================
 
 def upload_to_drive(service, drive_folder_id):
-    if not service or not os.path.exists(COMBINED_PARQUET):
-        print("  ⚠️ Skipping upload (no service or file missing)")
+    """
+    Upload the combined Parquet file to Google Drive.
+
+    Strategy:
+      - If the file already exists in Drive → use files().update() to replace
+        its content IN-PLACE. The file ID stays the same, so any public sharing
+        link shared previously will continue to work forever.
+      - If no file exists yet (first run) → use files().create() to create it.
+        After this first upload, share the link — it will never change again.
+
+    This replaces the old delete + create pattern which generated a new file ID
+    (and therefore a new link) on every single run.
+    """
+    if not service:
+        print("  ⚠️ No Drive service — skipping upload")
         return 0
 
+    if not os.path.exists(COMBINED_PARQUET):
+        print("  ⚠️ Parquet file not found — skipping upload")
+        return 0
+
+    uploaded = 0
     parquet_name = "DGI_COMBINED.parquet"
+
     try:
+        # Find all files in the folder matching our target name
         existing_files = [
             f for f in list_drive_files(service, drive_folder_id)
             if f['name'] == parquet_name
         ]
-        media = MediaFileUpload(COMBINED_PARQUET, mimetype='application/octet-stream', resumable=True)
+
+        media = MediaFileUpload(
+            COMBINED_PARQUET,
+            mimetype='application/octet-stream',
+            resumable=True,   # Avoids silent timeout failures for large files
+        )
 
         if existing_files:
+            # ✅ FILE ALREADY EXISTS — update content in-place
+            # files().update() replaces the bytes but keeps the same file ID,
+            # so all previously shared public links remain valid.
             existing_id = existing_files[0]['id']
+
+            # If duplicates somehow exist, clean them up first
             for duplicate in existing_files[1:]:
-                service.files().delete(fileId=duplicate['id'], supportsAllDrives=True).execute()
-                print(f"  🗑 Removed duplicate (ID: {duplicate['id']})")
-            service.files().update(fileId=existing_id, media_body=media, supportsAllDrives=True).execute()
+                service.files().delete(
+                    fileId=duplicate['id'],
+                    supportsAllDrives=True,
+                ).execute()
+                print(f"  🗑 Removed duplicate copy (ID: {duplicate['id']})")
+
+            service.files().update(
+                fileId=existing_id,
+                media_body=media,
+                supportsAllDrives=True,
+            ).execute()
             print(f"  ✓ Updated in-place: {parquet_name} (file ID & public link preserved ✅)")
+
         else:
+            # 🆕 FIRST RUN — file does not exist yet, create it
             service.files().create(
                 body={'name': parquet_name, 'parents': [drive_folder_id]},
-                media_body=media, fields='id', supportsAllDrives=True,
+                media_body=media,
+                fields='id',
+                supportsAllDrives=True,
             ).execute()
             print(f"  ✓ Created new: {parquet_name} (first upload)")
-            print(f"  ℹ️  Share this file's public link now — it will never change.")
-        return 1
-    except Exception as e:
-        print(f"  ✗ Upload failed: {str(e)}")
-        return 0
+            print(f"  ℹ️  Share this file's public link now — it will never change on future runs.")
 
+        uploaded = 1
+
+    except Exception as e:
+        print(f"  ✗ Upload failed for Parquet: {str(e)}")
+
+    return uploaded
+
+# =============================================================================
+# CLEANUP OLD FILES
+# =============================================================================
 
 def cleanup_old_files(service, drive_folder_id, cutoff_date):
+    """
+    Delete Excel files older than 5 years from Google Drive.
+    Uses paginated list_drive_files() — safe as folder grows past 100 files.
+    """
     if not service:
+        print("  ⚠️ No Drive service — skipping cleanup")
         return 0, 0
+
     deleted = kept = 0
+
     try:
         xlsx_mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        for file in list_drive_files(service, drive_folder_id, mime_type=xlsx_mime):
+        all_files = list_drive_files(service, drive_folder_id, mime_type=xlsx_mime)
+
+        for file in all_files:
             filename = file['name']
+            file_id  = file['id']
             parsed   = parse_filename_to_date(filename)
+
             if parsed:
                 year, month = parsed
-                if datetime(year, month, 1) >= cutoff_date:
+                file_date = datetime(year, month, 1)
+                if file_date >= cutoff_date:
                     kept += 1
                 else:
-                    service.files().delete(fileId=file['id'], supportsAllDrives=True).execute()
+                    service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
                     print(f"  🗑 Deleted old: {filename}")
                     deleted += 1
             else:
-                kept += 1
+                kept += 1   # Keep unparseable files (safety)
+
     except Exception as e:
         print(f"  ⚠️ Cleanup error: {str(e)}")
+
     return kept, deleted
 
 # =============================================================================
@@ -573,138 +625,56 @@ def cleanup_old_files(service, drive_folder_id, cutoff_date):
 # =============================================================================
 
 def main():
-    start_time = datetime.now()
-    run_log    = []
-
-    def log(msg):
-        print(msg)
-        run_log.append(msg)
-
-    log("=" * 70)
-    log("DGI Cameroon - GitHub Actions Automation (OAuth + Sentinel)")
-    log(f"Started: {start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    log("=" * 70)
+    print("=" * 70)
+    print("DGI Cameroon - GitHub Actions Automation (OAuth)")
+    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 70)
 
     DRIVE_FOLDER_ID = os.environ.get('DRIVE_FOLDER_ID', '')
-    now             = datetime.now()
-    cutoff_date     = datetime(now.year - YEARS_TO_KEEP, 1, 1)
-    expected_year, expected_month = get_expected_latest_month()
-    expected_month_name = FRENCH_MONTHS[expected_month]
 
-    log(f"📅 Data window: {cutoff_date.strftime('%Y-%m')} → "
-        f"{expected_year}-{expected_month:02d} (latest expected)")
-    log(f"📄 Sentinel file : {SENTINEL_FILE}")
-    log(f"   Current value : '{read_sentinel()}'")
-    log(f"   Expected key  : '{sentinel_month_key(expected_year, expected_month)}'")
+    # Cutoff date = January 1st of (current_year - 5)
+    # This ensures the first year in the window is always complete.
+    # e.g. running in Feb 2026 → cutoff is Jan 1 2021 (not Mar 2021)
+    now = datetime.now()
+    cutoff_date = datetime(now.year - YEARS_TO_KEEP, 1, 1)
+    print(f"📅 Data window: {cutoff_date.strftime('%Y-%m')} → {now.strftime('%Y-%m')}")
 
-    # -------------------------------------------------------------------------
-    # SENTINEL CHECK (Python-side safety net — primary check is in the YAML)
-    # -------------------------------------------------------------------------
-    if sentinel_already_downloaded():
-        msg = (f"ℹ️  Sentinel confirms {expected_month_name} {expected_year} was "
-               f"already downloaded this month. Nothing to do.")
-        log(msg)
-        send_email_notification(
-            subject=f"Skipped — {expected_month_name} {expected_year} already downloaded",
-            body="\n".join(run_log),
-            status="info",
-        )
-        sys.exit(0)
-
-    # -------------------------------------------------------------------------
-    # PROBE DGI SITE
-    # -------------------------------------------------------------------------
-    if not probe_latest_file_available():
-        log(f"ℹ️  {expected_month_name} {expected_year} not yet on DGI site. "
-            f"Will retry next scheduled run.")
-        send_email_notification(
-            subject=f"Skipped — {expected_month_name} {expected_year} not yet published",
-            body="\n".join(run_log),
-            status="warning",
-        )
-        sys.exit(0)
-
-    log(f"✅ New file confirmed available — proceeding with full pipeline.\n")
-
-    # -------------------------------------------------------------------------
-    # FULL PIPELINE
-    # -------------------------------------------------------------------------
     months_to_process = get_month_list()
-    log(f"📊 Will process {len(months_to_process)} months")
+    print(f"📊 Will process {len(months_to_process)} months")
 
-    downloaded, skipped, failed, failed_files = download_all_parallel(months_to_process)
+    # Step 1: Parallel download
+    downloaded, skipped, failed = download_all_parallel(months_to_process)
 
+    # Step 2: Incremental Parquet build (skips if nothing new)
     parquet_path = combine_to_parquet(newly_downloaded=downloaded)
 
-    log("\n🔐 Authenticating Google Drive...")
+    # Step 3: Auth
+    print("\n🔐 Authenticating Google Drive...")
     drive_service = authenticate_drive()
 
-    uploaded = kept = deleted = 0
+    # Step 4: Upload + cleanup
     if drive_service and DRIVE_FOLDER_ID:
-        log("\n📤 Uploading to Google Drive...")
+        print("\n📤 Uploading to Google Drive...")
         uploaded = upload_to_drive(drive_service, DRIVE_FOLDER_ID)
-        log(f"   Uploaded: {uploaded} files")
+        print(f"   Uploaded: {uploaded} files")
 
-        log("\n🧹 Cleaning up files older than 5 years...")
+        print("\n🧹 Cleaning up files older than 5 years...")
         kept, deleted = cleanup_old_files(drive_service, DRIVE_FOLDER_ID, cutoff_date)
-        log(f"   Kept: {kept}, Deleted: {deleted}")
+        print(f"   Kept: {kept}, Deleted: {deleted}")
     else:
-        log("\n⚠️ Skipping Drive operations (no credentials or folder ID)")
+        print("\n⚠️ Skipping Drive operations (no credentials or folder ID)")
 
-    # -------------------------------------------------------------------------
-    # WRITE SENTINEL — only after the expected latest file is confirmed on disk
-    # -------------------------------------------------------------------------
-    latest_filename = f"FICHIER_{expected_month_name}_{expected_year}.xlsx"
-    latest_path     = os.path.join(DOWNLOAD_DIR, latest_filename)
-
-    if os.path.exists(latest_path):
-        write_sentinel(expected_year, expected_month)
-        log(f"\n✅ Sentinel updated → '{sentinel_month_key(expected_year, expected_month)}'")
-        log("   (Workflow will commit this to the repo to cancel remaining runs this month)")
-    else:
-        log(f"\n⚠️  Latest file ({latest_filename}) not on disk — sentinel NOT updated.")
-        log("   Next scheduled run will try again.")
-
-    # -------------------------------------------------------------------------
-    # SUMMARY + EMAIL
-    # -------------------------------------------------------------------------
-    end_time   = datetime.now()
-    duration   = end_time - start_time
-    parquet_mb = (os.path.getsize(parquet_path) / 1024 / 1024
-                  if parquet_path and os.path.exists(parquet_path) else 0)
-
-    summary_lines = [
-        "",
-        "=" * 70,
-        "✅ EXECUTION COMPLETE",
-        f"   Run duration:  {duration}",
-        f"   Downloaded:    {downloaded} new files",
-        f"   Skipped:       {skipped} (already existed)",
-        f"   Failed:        {failed} (not found or error)",
-        f"   Parquet:       {parquet_mb:.1f} MB",
-        f"   Drive upload:  {uploaded} file(s)",
-        f"   Drive cleanup: kept {kept}, deleted {deleted}",
-        f"Finished: {end_time.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-        "=" * 70,
-    ]
-    if failed_files:
-        summary_lines += ["", "⚠️  Files that could not be downloaded:"]
-        summary_lines += [f"   • {f}" for f in failed_files]
-
-    for line in summary_lines:
-        log(line)
-
-    overall_status = (
-        "error"   if failed > downloaded else
-        "success" if downloaded > 0     else
-        "warning"
-    )
-    send_email_notification(
-        subject=(f"Run complete — {downloaded} new, {skipped} skipped, "
-                 f"{failed} failed ({expected_month_name} {expected_year})"),
-        body="\n".join(run_log),
-        status=overall_status,
-    )
+    # Summary
+    print("\n" + "=" * 70)
+    print("✅ EXECUTION COMPLETE")
+    print(f"   Downloaded: {downloaded} new files")
+    print(f"   Skipped:    {skipped} (already existed)")
+    print(f"   Failed:     {failed} (not found or error)")
+    if parquet_path and os.path.exists(parquet_path):
+        size_mb = os.path.getsize(parquet_path) / 1024 / 1024
+        print(f"   Parquet:    {size_mb:.1f} MB → {parquet_path}")
+    print(f"Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
