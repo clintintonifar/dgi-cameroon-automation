@@ -42,7 +42,7 @@ import random
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-YEARS_TO_KEEP      = 5
+YEARS_TO_KEEP      = 4
 DOWNLOAD_WORKERS   = 3     # Optimal for GitHub Actions 2-core free runners
 MAX_RETRIES        = 5
 RETRY_DELAY        = 5
