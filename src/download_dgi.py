@@ -1,38 +1,29 @@
 # =============================================================================
 # DGI Cameroon - GitHub Actions Automation (OAuth Version)
 # Rolling 5-Year Window: Always keep last 5 full years of data
-# The first year is always COMPLETE (starts at January of current_year - 5)
-# Output: DGI_COMBINED.parquet (~300-500MB vs 1.5GB CSV)
-# Uses OAuth Refresh Token (Personal Account Quota)
-# ALL credentials loaded from GitHub Secrets (environment variables)
 #
-# Optimizations applied:
-#   [1] PyArrow ParquetWriter — stream-writes parquet incrementally,
-#       no full DataFrame held in RAM, no giant concat at the end
-#   [2] calamine engine — Rust-based Excel reader, 3-6x faster than openpyxl
-#   [3] DOWNLOAD_WORKERS = 3 — optimal for GitHub Actions 2-core free runners
-#   [4] requests timeout = 20s — faster fail + retry, not 60s hanging
-#   [5] Drive list() with pagination — safe when folder grows large
+# OUTPUT STRATEGY — 2 tables (Power BI optimised, ~80% size reduction):
 #
-# Drive upload strategy:
-#   uses files().update() to replace content IN-PLACE on every run,
-#   preserving the same file ID and public sharing link forever.
-#   Only uses files().create() on the very first upload.
+#   DGI_CURRENT.parquet   (~533k rows, ~40 MB)
+#     └─ Full taxpayer snapshot for the LATEST month only.
+#        Use for: company lookup, name search, slicer dimensions
+#        (REGIME, CRI, CENTRE_DE_RATTACHEMENT).
 #
-# Naming-convention fix (v3):
-#   The DGI site uses inconsistent separators between FICHIER / MONTH / YEAR.
-#   build_candidate_urls() tries all 16 variants (8 separator combos × 2 cases).
+#   DGI_PRESENCE.parquet  (~17M rows, ~60 MB)
+#     └─ One row per (NIU, YEAR, MONTH) — only 3 narrow columns.
+#        NIU is dictionary-encoded so 17M rows compress to ~60 MB.
+#        Powers ALL visuals: heatmap, trend charts, KPIs, new registrations.
+#        Absent (NIU, YEAR, MONTH) = taxpayer was inactive that month.
 #
-# Smart sentinel check (v5):
-#   After a successful download, writes last_downloaded.txt to the repo root
-#   (committed by the workflow via git). On the next scheduled run, the YAML
-#   checks this file BEFORE installing Python — if the current expected month
-#   is already recorded, the job is cancelled in ~5 seconds at zero cost.
-#   The Python script also re-checks internally as a safety net.
+#   Relationship: DGI_CURRENT[NIU] → DGI_PRESENCE[NIU]  (1-to-many, both)
+#   TOTAL: ~100 MB in Power BI  vs  660 MB previously.
 #
-# Email notifications (v4):
-#   Sends a summary email (to NOTIFY_EMAIL) via SMTP after every run.
-#   Supports Gmail (smtp.gmail.com:587) and Outlook (smtp.office365.com:587).
+# Build strategy:
+#   Single pass over all Excel files in chronological order.
+#   PRESENCE written incrementally via streaming ParquetWriter (no concat).
+#   Only one month's DataFrame is in RAM at a time (~120 MB peak).
+#
+# All other infrastructure (sentinel, email, Drive upload) is unchanged.
 # =============================================================================
 
 import os
@@ -46,7 +37,7 @@ import pyarrow.parquet as pq
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -55,31 +46,35 @@ import random
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-YEARS_TO_KEEP      = 5
-DOWNLOAD_WORKERS   = 3
-MAX_RETRIES        = 5
-RETRY_DELAY        = 5
-REQUEST_TIMEOUT    = 20
+YEARS_TO_KEEP    = 5
+DOWNLOAD_WORKERS = 3
+MAX_RETRIES      = 5
+RETRY_DELAY      = 5
+REQUEST_TIMEOUT  = 20
 
-# Path to the sentinel file — committed to repo root by the workflow after
-# a successful download so subsequent runs in the same month skip instantly.
 SENTINEL_FILE = os.path.join(
     os.environ.get('GITHUB_WORKSPACE', '.'),
     'last_downloaded.txt'
 )
 
 FRENCH_MONTHS = {
-    1: 'JANVIER', 2: 'FEVRIER', 3: 'MARS', 4: 'AVRIL',
-    5: 'MAI', 6: 'JUIN', 7: 'JUILLET', 8: 'AOUT',
+    1: 'JANVIER', 2: 'FEVRIER', 3: 'MARS',    4: 'AVRIL',
+    5: 'MAI',     6: 'JUIN',    7: 'JUILLET',  8: 'AOUT',
     9: 'SEPTEMBRE', 10: 'OCTOBRE', 11: 'NOVEMBRE', 12: 'DECEMBRE'
 }
+
+# Reverse lookup: French month name → month number
+FRENCH_MONTHS_REVERSE = {v: k for k, v in FRENCH_MONTHS.items()}
 
 CANONICAL_COLUMNS = [
     'RAISON_SOCIALE', 'SIGLE', 'NIU', 'ACTIVITE_PRINCIPALE',
     'REGIME', 'CRI', 'CENTRE_DE_RATTACHEMENT',
 ]
 
-PARQUET_SCHEMA = pa.schema([
+# ── Parquet schemas ──────────────────────────────────────────────────────────
+
+# Current-month full snapshot (Power BI: lookup / drill-through)
+CURRENT_SCHEMA = pa.schema([
     pa.field('YEAR',                   pa.int16()),
     pa.field('MONTH',                  pa.int16()),
     pa.field('RAISON_SOCIALE',         pa.string()),
@@ -91,73 +86,54 @@ PARQUET_SCHEMA = pa.schema([
     pa.field('CENTRE_DE_RATTACHEMENT', pa.string()),
 ])
 
+# Per-taxpayer monthly presence (Power BI: all visuals)
+# 3 narrow columns — NIU dictionary-encoded → ~60 MB for 17M rows
+PRESENCE_SCHEMA = pa.schema([
+    pa.field('NIU',   pa.dictionary(pa.int32(), pa.string())),
+    pa.field('YEAR',  pa.int16()),
+    pa.field('MONTH', pa.int16()),
+])
+
 BASE_HOST        = "https://teledeclaration-dgi.cm/UploadedFiles/AttachedFiles/ArchiveListecontribuable"
 DOWNLOAD_DIR     = "/tmp/dgi_downloads"
-COMBINED_PARQUET = "/tmp/dgi_downloads/DGI_COMBINED.parquet"
+CURRENT_PARQUET  = "/tmp/dgi_downloads/DGI_CURRENT.parquet"
+PRESENCE_PARQUET = "/tmp/dgi_downloads/DGI_PRESENCE.parquet"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # =============================================================================
-# SENTINEL FILE — tracks the last successfully downloaded month
+# SENTINEL
 # =============================================================================
 
 def get_expected_latest_month() -> tuple:
-    """
-    Return (year, month) of the most recent file that should exist on DGI.
-    DGI publishes month M data during month M+1, so expected latest = previous month.
-    e.g. running in February 2026 → expected latest = January 2026
-    """
     now = datetime.now()
     if now.month == 1:
         return (now.year - 1, 12)
     return (now.year, now.month - 1)
 
-
 def sentinel_month_key(year: int, month: int) -> str:
-    """Canonical string stored in sentinel file — e.g. '2026-01'"""
     return f"{year}-{month:02d}"
 
-
 def read_sentinel() -> str:
-    """Read sentinel file. Returns empty string if it doesn't exist."""
     if os.path.exists(SENTINEL_FILE):
         with open(SENTINEL_FILE, 'r') as f:
             return f.read().strip()
     return ''
 
-
 def write_sentinel(year: int, month: int):
-    """
-    Write successfully-downloaded month to the sentinel file.
-    The workflow's git commit step pushes this back to the repo so the
-    next scheduled run sees it immediately and exits in ~5 seconds.
-    """
     key = sentinel_month_key(year, month)
     with open(SENTINEL_FILE, 'w') as f:
         f.write(key + '\n')
     print(f"  📝 Sentinel written: {SENTINEL_FILE} → '{key}'")
 
-
 def sentinel_already_downloaded() -> bool:
-    """True if sentinel already records the current expected month."""
     expected_year, expected_month = get_expected_latest_month()
-    expected_key = sentinel_month_key(expected_year, expected_month)
-    return read_sentinel() == expected_key
+    return read_sentinel() == sentinel_month_key(expected_year, expected_month)
 
 # =============================================================================
 # EMAIL NOTIFICATION
 # =============================================================================
 
 def send_email_notification(subject: str, body: str, status: str = "info"):
-    """
-    Send a run summary email via SMTP.
-
-    Required GitHub Secrets → env vars:
-        SMTP_HOST      — smtp.gmail.com  OR  smtp.office365.com
-        SMTP_PORT      — 587 (STARTTLS)
-        SMTP_USER      — your full email address (sender)
-        SMTP_PASSWORD  — Gmail App Password or Outlook password
-        NOTIFY_EMAIL   — recipient address (can be same as SMTP_USER)
-    """
     smtp_host = os.environ.get('SMTP_HOST', '')
     smtp_port = int(os.environ.get('SMTP_PORT', '587'))
     smtp_user = os.environ.get('SMTP_USER', '')
@@ -166,7 +142,6 @@ def send_email_notification(subject: str, body: str, status: str = "info"):
 
     if not all([smtp_host, smtp_user, smtp_pass, notify_to]):
         print("  ⚠️  Email config incomplete — skipping notification")
-        print("      Set SMTP_HOST, SMTP_USER, SMTP_PASSWORD, NOTIFY_EMAIL secrets.")
         return
 
     emoji = {'success': '✅', 'warning': '⚠️', 'error': '❌'}.get(status, 'ℹ️')
@@ -195,9 +170,7 @@ def send_email_notification(subject: str, body: str, status: str = "info"):
 
     try:
         with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
+            server.ehlo(); server.starttls(); server.ehlo()
             server.login(smtp_user, smtp_pass)
             server.sendmail(smtp_user, notify_to, msg.as_string())
         print(f"  📧 Notification sent → {notify_to}")
@@ -205,10 +178,10 @@ def send_email_notification(subject: str, body: str, status: str = "info"):
         print(f"  ⚠️  Email send failed: {e}")
 
 # =============================================================================
-# HELPER FUNCTIONS
+# HELPERS
 # =============================================================================
 
-def parse_filename_to_date(filename):
+def parse_filename_to_date(filename: str):
     """Extract (year, month) from 'FICHIER_JANVIER_2026.xlsx'"""
     try:
         clean = filename.replace("FICHIER_", "").replace(".xlsx", "")
@@ -217,59 +190,16 @@ def parse_filename_to_date(filename):
             return None
         month_name, year_str = parts
         year = int(year_str)
-        for num, name in FRENCH_MONTHS.items():
-            if name == month_name:
-                return (year, num)
-        return None
+        month = FRENCH_MONTHS_REVERSE.get(month_name.upper())
+        return (year, month) if month else None
     except Exception:
         return None
 
 
-def probe_latest_file_available() -> bool:
-    """
-    Probe the DGI website to confirm the expected latest file is published.
-    Uses HEAD requests (zero bandwidth) across all URL variants.
-    Returns True if any variant returns HTTP 200.
-    """
-    expected_year, expected_month = get_expected_latest_month()
-    month_name = FRENCH_MONTHS[expected_month]
-
-    print(f"\n🔍 Probing DGI site for: FICHIER_*{month_name}*{expected_year}.xlsx ...")
-
-    candidate_urls = build_candidate_urls(month_name, expected_year)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    }
-
-    for url in candidate_urls:
-        try:
-            resp = requests.head(url, headers=headers, timeout=REQUEST_TIMEOUT,
-                                 allow_redirects=True)
-            if resp.status_code == 200:
-                print(f"  ✅ File confirmed available at: {url}")
-                return True
-            if resp.status_code == 405:
-                resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, stream=True)
-                resp.close()
-                if resp.status_code == 200:
-                    print(f"  ✅ File confirmed available at: {url}")
-                    return True
-        except Exception:
-            continue
-
-    print(f"  ℹ️  {month_name} {expected_year} not yet published on DGI site.")
-    return False
-
-
 def get_month_list():
-    """
-    Generate (year, month) tuples for the full 5-year window.
-    Upper bound = previous month (current month's data isn't published yet).
-    """
     now = datetime.now()
     start_year, start_month = now.year - YEARS_TO_KEEP, 1
     end_year, end_month = get_expected_latest_month()
-
     months = []
     year, month = start_year, start_month
     while (year, month) <= (end_year, end_month):
@@ -280,19 +210,42 @@ def get_month_list():
             year += 1
     return months
 
+
+def probe_latest_file_available() -> bool:
+    expected_year, expected_month = get_expected_latest_month()
+    month_name = FRENCH_MONTHS[expected_month]
+    print(f"\n🔍 Probing DGI site for: FICHIER_*{month_name}*{expected_year}.xlsx ...")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    }
+    for url in build_candidate_urls(month_name, expected_year):
+        try:
+            resp = requests.head(url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            if resp.status_code == 200:
+                print(f"  ✅ File confirmed at: {url}")
+                return True
+            if resp.status_code == 405:
+                resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, stream=True)
+                resp.close()
+                if resp.status_code == 200:
+                    print(f"  ✅ File confirmed at: {url}")
+                    return True
+        except Exception:
+            continue
+    print(f"  ℹ️  {month_name} {expected_year} not yet published.")
+    return False
+
 # =============================================================================
 # URL CANDIDATE BUILDER
 # =============================================================================
 
 def build_candidate_urls(month_name: str, year: int) -> list:
-    """Return every plausible URL variant for one month's file."""
     separators = [
         ('%20',  '%20'), ('_',    '%20'), ('%20',  '_'),   ('_',    '_'),
         ('%20_', '%20'), ('_%20', '%20'), ('%20_', '_'),   ('_%20', '_'),
     ]
-    month_variants = [month_name, month_name.capitalize()]
     urls = []
-    for mv in month_variants:
+    for mv in [month_name, month_name.capitalize()]:
         for s1, s2 in separators:
             urls.append(f"{BASE_HOST}/FICHIER{s1}{mv}{s2}{year}.xlsx")
     return urls
@@ -309,7 +262,6 @@ def download_file(year, month):
     if os.path.exists(filepath):
         return year, month, 'skipped'
 
-    candidate_urls = build_candidate_urls(month_name, year)
     headers = {
         "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
         "Accept":          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/octet-stream, */*",
@@ -317,9 +269,8 @@ def download_file(year, month):
         "Connection":      "keep-alive",
         "Cache-Control":   "no-cache",
     }
-    last_status = 'not_found'
 
-    for url in candidate_urls:
+    for url in build_candidate_urls(month_name, year):
         for attempt in range(MAX_RETRIES):
             try:
                 response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
@@ -328,25 +279,21 @@ def download_file(year, month):
                         f.write(response.content)
                     return year, month, 'downloaded'
                 elif response.status_code == 404:
-                    last_status = 'not_found'
                     break
                 else:
-                    last_status = 'failed'
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(RETRY_DELAY + random.uniform(1, 3))
             except Exception:
-                last_status = 'failed'
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY + random.uniform(1, 3))
 
-    return year, month, last_status
+    return year, month, 'not_found'
 
 
 def download_all_parallel(months_to_process):
     downloaded = skipped = failed = 0
     failed_files = []
     total = len(months_to_process)
-
     print(f"\n📥 Downloading {total} months ({DOWNLOAD_WORKERS} parallel threads)...")
 
     with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
@@ -360,29 +307,25 @@ def download_all_parallel(months_to_process):
             month_name = FRENCH_MONTHS[month]
             completed += 1
             label = f"  [{completed}/{total}]"
-
             if status == 'downloaded':
                 downloaded += 1
                 print(f"{label} ✓ Downloaded: FICHIER_{month_name}_{year}.xlsx")
             elif status == 'skipped':
                 skipped += 1
-                print(f"{label} → Skip: FICHIER_{month_name}_{year}.xlsx (exists)")
-            elif status == 'not_found':
-                failed += 1
-                failed_files.append(f"FICHIER_{month_name}_{year}.xlsx (not found)")
-                print(f"{label} ⚠ Not found: FICHIER_{month_name}_{year}.xlsx")
+                print(f"{label} → Skip (exists): FICHIER_{month_name}_{year}.xlsx")
             else:
                 failed += 1
-                failed_files.append(f"FICHIER_{month_name}_{year}.xlsx (error)")
-                print(f"{label} ✗ Failed: FICHIER_{month_name}_{year}.xlsx")
+                failed_files.append(f"FICHIER_{month_name}_{year}.xlsx")
+                print(f"{label} ⚠ Not found: FICHIER_{month_name}_{year}.xlsx")
 
     return downloaded, skipped, failed, failed_files
 
 # =============================================================================
-# COLUMN NORMALIZATION
+# COLUMN NORMALISATION
 # =============================================================================
 
-def normalize_to_arrow_table(df, year, month):
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalise raw Excel DataFrame to canonical columns with clean strings."""
     df.columns = [str(c).strip().upper() for c in df.columns]
     for drop_col in ['N°', 'N', 'Nº']:
         if drop_col in df.columns:
@@ -393,71 +336,133 @@ def normalize_to_arrow_table(df, year, month):
     df = df[CANONICAL_COLUMNS].copy()
     for col in CANONICAL_COLUMNS:
         df[col] = df[col].astype(str).str.strip().replace('nan', '')
-    n = len(df)
-    df.insert(0, 'MONTH', pd.array([month] * n, dtype='int16'))
-    df.insert(0, 'YEAR',  pd.array([year]  * n, dtype='int16'))
-    return pa.Table.from_pandas(df, schema=PARQUET_SCHEMA, preserve_index=False)
+    return df
 
 # =============================================================================
-# COMBINE — INCREMENTAL PARQUET STREAMING
+# BUILD CURRENT + PRESENCE PARQUETS
 # =============================================================================
 
-def combine_to_parquet(newly_downloaded):
-    if newly_downloaded == 0 and os.path.exists(COMBINED_PARQUET):
-        size_mb = os.path.getsize(COMBINED_PARQUET) / 1024 / 1024
-        print(f"\n📊 No new files — reusing existing Parquet ({size_mb:.1f} MB)")
-        return COMBINED_PARQUET
+def build_parquets(newly_downloaded: int) -> tuple:
+    """
+    Build both Power BI output files in a single chronological pass.
 
-    print("\n📊 Building Parquet incrementally (PyArrow streaming writer)...")
+    DGI_CURRENT.parquet  — latest month full snapshot  (~533k rows, ~40 MB)
+    DGI_PRESENCE.parquet — NIU × YEAR × MONTH presence (~17M rows, ~60 MB)
 
-    xlsx_files = sorted([
-        f for f in os.listdir(DOWNLOAD_DIR)
-        if f.endswith('.xlsx') and f.startswith('FICHIER_')
-    ])
+    Memory strategy
+    ───────────────
+    Only ONE month's DataFrame is in RAM at a time.
+    PRESENCE is written incrementally via streaming ParquetWriter — no
+    accumulation, no giant concat. Peak RAM ≈ one month (~120 MB).
 
-    if not xlsx_files:
-        print("  ⚠️ No Excel files found to combine.")
-        return None
+    Skips rebuild if both files already exist and nothing new was downloaded.
+    """
+    both_exist = (
+        os.path.exists(CURRENT_PARQUET) and
+        os.path.exists(PRESENCE_PARQUET)
+    )
+    if newly_downloaded == 0 and both_exist:
+        cur_mb = os.path.getsize(CURRENT_PARQUET)  / 1024 / 1024
+        pre_mb = os.path.getsize(PRESENCE_PARQUET) / 1024 / 1024
+        print(f"\n📊 No new files — reusing existing Parquets "
+              f"(Current: {cur_mb:.1f} MB, Presence: {pre_mb:.1f} MB)")
+        return CURRENT_PARQUET, PRESENCE_PARQUET
 
+    print("\n📊 Building CURRENT + PRESENCE (single pass)...")
+
+    # ── Collect and sort files chronologically ───────────────────────────────
+    dated_files = []
+    for filename in os.listdir(DOWNLOAD_DIR):
+        if not (filename.endswith('.xlsx') and filename.startswith('FICHIER_')):
+            continue
+        parsed = parse_filename_to_date(filename)
+        if parsed:
+            dated_files.append((parsed[0], parsed[1], filename))
+        else:
+            print(f"  ⚠ Skipping unparseable file: {filename}")
+
+    if not dated_files:
+        print("  ⚠ No valid Excel files found.")
+        return None, None
+
+    dated_files.sort(key=lambda x: (x[0], x[1]))
+    total = len(dated_files)
+    latest_year, latest_month, _ = dated_files[-1]
+
+    # ── Excel engine ─────────────────────────────────────────────────────────
     try:
-        import python_calamine  # noqa: F401
+        import python_calamine  # noqa
         excel_engine = 'calamine'
-        print("  ⚡ Excel engine: calamine (Rust-based)")
+        print("  ⚡ Excel engine: calamine (Rust-based, 3-6× faster)")
     except ImportError:
         excel_engine = 'openpyxl'
-        print("  ⚠️ Excel engine: openpyxl (install python-calamine for 3-6x speedup)")
+        print("  ⚠ Excel engine: openpyxl (install python-calamine for speedup)")
 
-    total_rows = 0
+    total_presence_rows = 0
 
+    # ── Open streaming PRESENCE writer — stays open for the entire loop ──────
     with pq.ParquetWriter(
-        COMBINED_PARQUET, schema=PARQUET_SCHEMA,
-        compression='snappy', use_dictionary=True, write_statistics=True,
-    ) as writer:
-        for i, filename in enumerate(xlsx_files, 1):
-            parsed = parse_filename_to_date(filename)
-            if parsed is None:
-                print(f"  ⚠ Skipping (unparseable name): {filename}")
-                continue
-            year, month = parsed
+        PRESENCE_PARQUET, schema=PRESENCE_SCHEMA,
+        compression='snappy',
+        use_dictionary=True,   # key: dictionary-encodes NIU → ~60 MB for 17M rows
+        write_statistics=True,
+    ) as presence_writer:
+
+        for i, (year, month, filename) in enumerate(dated_files, 1):
             filepath = os.path.join(DOWNLOAD_DIR, filename)
             try:
-                df = pd.read_excel(filepath, sheet_name=0, dtype=str, engine=excel_engine)
-                df.dropna(how='all', inplace=True)
-                arrow_table = normalize_to_arrow_table(df, year, month)
-                writer.write_table(arrow_table, row_group_size=100_000)
-                total_rows += len(arrow_table)
-                print(f"  [{i}/{len(xlsx_files)}] ✓ {filename} — {len(arrow_table):,} rows")
+                raw = pd.read_excel(filepath, sheet_name=0, dtype=str, engine=excel_engine)
+                raw.dropna(how='all', inplace=True)
+                df  = normalize_df(raw)
             except Exception as e:
-                print(f"  [{i}/{len(xlsx_files)}] ✗ Failed: {filename} — {str(e)}")
+                print(f"  [{i}/{total}] ✗ Failed to read {filename}: {e}")
+                continue
 
-    if total_rows == 0:
-        print("  ✗ No data written.")
-        os.remove(COMBINED_PARQUET)
-        return None
+            df_valid = df[df['NIU'] != ''].copy()
 
-    size_mb = os.path.getsize(COMBINED_PARQUET) / 1024 / 1024
-    print(f"\n  ✅ Parquet ready: {total_rows:,} rows, {size_mb:.1f} MB")
-    return COMBINED_PARQUET
+            # ── Write presence rows for this month ───────────────────────────
+            # pd.Categorical tells PyArrow to use dictionary encoding on NIU
+            n = len(df_valid)
+            presence_table = pa.Table.from_pandas(
+                pd.DataFrame({
+                    'NIU':   pd.Categorical(df_valid['NIU']),
+                    'YEAR':  pd.array([year]  * n, dtype='int16'),
+                    'MONTH': pd.array([month] * n, dtype='int16'),
+                }),
+                schema=PRESENCE_SCHEMA,
+                preserve_index=False,
+            )
+            presence_writer.write_table(presence_table, row_group_size=200_000)
+            total_presence_rows += n
+
+            # ── Write CURRENT for the latest month only ──────────────────────
+            if year == latest_year and month == latest_month:
+                df_current = df_valid.copy()
+                df_current.insert(0, 'MONTH', pd.array([month] * n, dtype='int16'))
+                df_current.insert(0, 'YEAR',  pd.array([year]  * n, dtype='int16'))
+                pq.write_table(
+                    pa.Table.from_pandas(df_current, schema=CURRENT_SCHEMA, preserve_index=False),
+                    CURRENT_PARQUET,
+                    compression='snappy', use_dictionary=True, write_statistics=True,
+                )
+                cur_mb = os.path.getsize(CURRENT_PARQUET) / 1024 / 1024
+                print(f"  [{i}/{total}] ✓ {filename} — {n:,} rows → CURRENT ({cur_mb:.1f} MB) + PRESENCE")
+            else:
+                print(f"  [{i}/{total}] ✓ {filename} — {n:,} rows → PRESENCE")
+
+            # Free this month from RAM before loading the next one
+            del df, df_valid, raw, presence_table
+
+    # PRESENCE writer flushed and closed here
+
+    cur_mb = os.path.getsize(CURRENT_PARQUET)  / 1024 / 1024 if os.path.exists(CURRENT_PARQUET) else 0
+    pre_mb = os.path.getsize(PRESENCE_PARQUET) / 1024 / 1024
+
+    print(f"\n  ✅ CURRENT  : {cur_mb:.1f} MB  (~{latest_year}-{latest_month:02d} snapshot)")
+    print(f"  ✅ PRESENCE : {pre_mb:.1f} MB  ({total_presence_rows:,} rows)")
+    print(f"\n  📉 Total in Power BI: {cur_mb + pre_mb:.1f} MB  (was 660 MB)")
+
+    return CURRENT_PARQUET, PRESENCE_PARQUET
 
 # =============================================================================
 # GOOGLE DRIVE
@@ -488,7 +493,7 @@ def authenticate_drive():
         print("  ✅ Google Drive authenticated via OAuth")
         return service
     except Exception as e:
-        print(f"  ⚠️ Drive auth failed: {str(e)}")
+        print(f"  ⚠️ Drive auth failed: {e}")
         return None
 
 
@@ -512,60 +517,80 @@ def list_drive_files(service, folder_id, mime_type=None):
     return files
 
 
-def upload_to_drive(service, drive_folder_id):
-    if not service or not os.path.exists(COMBINED_PARQUET):
-        print("  ⚠️ Skipping upload (no service or file missing)")
-        return 0
-
-    parquet_name = "DGI_COMBINED.parquet"
+def upload_file_to_drive(service, local_path: str, drive_name: str, folder_id: str) -> bool:
+    """
+    Upload a single file to Drive, updating in-place if it already exists.
+    Returns True on success.
+    """
     try:
-        existing_files = [
-            f for f in list_drive_files(service, drive_folder_id)
-            if f['name'] == parquet_name
+        existing = [
+            f for f in list_drive_files(service, folder_id)
+            if f['name'] == drive_name
         ]
-        media = MediaFileUpload(COMBINED_PARQUET, mimetype='application/octet-stream', resumable=True)
+        media = MediaFileUpload(local_path, mimetype='application/octet-stream', resumable=True)
 
-        if existing_files:
-            existing_id = existing_files[0]['id']
-            for duplicate in existing_files[1:]:
-                service.files().delete(fileId=duplicate['id'], supportsAllDrives=True).execute()
-                print(f"  🗑 Removed duplicate (ID: {duplicate['id']})")
-            service.files().update(fileId=existing_id, media_body=media, supportsAllDrives=True).execute()
-            print(f"  ✓ Updated in-place: {parquet_name} (file ID & public link preserved ✅)")
+        if existing:
+            file_id = existing[0]['id']
+            # Remove any duplicates beyond the first
+            for dup in existing[1:]:
+                service.files().delete(fileId=dup['id'], supportsAllDrives=True).execute()
+                print(f"  🗑 Removed duplicate: {drive_name} (ID: {dup['id']})")
+            service.files().update(
+                fileId=file_id, media_body=media, supportsAllDrives=True
+            ).execute()
+            print(f"  ✓ Updated in-place: {drive_name} (file ID & link preserved ✅)")
         else:
             service.files().create(
-                body={'name': parquet_name, 'parents': [drive_folder_id]},
+                body={'name': drive_name, 'parents': [folder_id]},
                 media_body=media, fields='id', supportsAllDrives=True,
             ).execute()
-            print(f"  ✓ Created new: {parquet_name} (first upload)")
-            print(f"  ℹ️  Share this file's public link now — it will never change.")
-        return 1
+            print(f"  ✓ Created new: {drive_name} (first upload)")
+            print(f"  ℹ️  Share this file's link now — it will never change.")
+        return True
     except Exception as e:
-        print(f"  ✗ Upload failed: {str(e)}")
+        print(f"  ✗ Upload failed for {drive_name}: {e}")
+        return False
+
+
+def upload_all_to_drive(service, folder_id: str) -> int:
+    """Upload both Parquet files to Drive. Returns count of successful uploads."""
+    if not service or not folder_id:
+        print("  ⚠️ Skipping upload (no service or folder ID)")
         return 0
 
+    uploads = 0
+    for local_path, drive_name in [
+        (CURRENT_PARQUET,  'DGI_CURRENT.parquet'),
+        (PRESENCE_PARQUET, 'DGI_PRESENCE.parquet'),
+    ]:
+        if os.path.exists(local_path):
+            if upload_file_to_drive(service, local_path, drive_name, folder_id):
+                uploads += 1
+        else:
+            print(f"  ⚠ Skipping {drive_name} — file not found locally")
+    return uploads
 
-def cleanup_old_files(service, drive_folder_id, cutoff_date):
+
+def cleanup_old_files(service, folder_id, cutoff_date):
     if not service:
         return 0, 0
     deleted = kept = 0
     try:
         xlsx_mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        for file in list_drive_files(service, drive_folder_id, mime_type=xlsx_mime):
-            filename = file['name']
-            parsed   = parse_filename_to_date(filename)
+        for f in list_drive_files(service, folder_id, mime_type=xlsx_mime):
+            parsed = parse_filename_to_date(f['name'])
             if parsed:
                 year, month = parsed
                 if datetime(year, month, 1) >= cutoff_date:
                     kept += 1
                 else:
-                    service.files().delete(fileId=file['id'], supportsAllDrives=True).execute()
-                    print(f"  🗑 Deleted old: {filename}")
+                    service.files().delete(fileId=f['id'], supportsAllDrives=True).execute()
+                    print(f"  🗑 Deleted old: {f['name']}")
                     deleted += 1
             else:
                 kept += 1
     except Exception as e:
-        print(f"  ⚠️ Cleanup error: {str(e)}")
+        print(f"  ⚠️ Cleanup error: {e}")
     return kept, deleted
 
 # =============================================================================
@@ -581,7 +606,7 @@ def main():
         run_log.append(msg)
 
     log("=" * 70)
-    log("DGI Cameroon - GitHub Actions Automation (OAuth + Sentinel)")
+    log("DGI Cameroon — GitHub Actions Automation (CURRENT + PRESENCE)")
     log(f"Started: {start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
     log("=" * 70)
 
@@ -593,97 +618,88 @@ def main():
 
     log(f"📅 Data window: {cutoff_date.strftime('%Y-%m')} → "
         f"{expected_year}-{expected_month:02d} (latest expected)")
-    log(f"📄 Sentinel file : {SENTINEL_FILE}")
-    log(f"   Current value : '{read_sentinel()}'")
-    log(f"   Expected key  : '{sentinel_month_key(expected_year, expected_month)}'")
+    log(f"📄 Sentinel   : '{read_sentinel()}' → expected '{sentinel_month_key(expected_year, expected_month)}'")
+    log("")
+    log("📦 Output: 2 files")
+    log("   DGI_CURRENT.parquet  — latest month snapshot  (~533k rows, ~40 MB)")
+    log("   DGI_PRESENCE.parquet — NIU×YEAR×MONTH, all 62 months (~17M rows, ~60 MB)")
 
-    # -------------------------------------------------------------------------
-    # SENTINEL CHECK (Python-side safety net — primary check is in the YAML)
-    # -------------------------------------------------------------------------
+    # ── Sentinel check ────────────────────────────────────────────────────────
     if sentinel_already_downloaded():
-        msg = (f"ℹ️  Sentinel confirms {expected_month_name} {expected_year} was "
-               f"already downloaded this month. Nothing to do.")
+        msg = (f"ℹ️  Sentinel confirms {expected_month_name} {expected_year} "
+               f"already downloaded. Nothing to do.")
         log(msg)
         send_email_notification(
             subject=f"Skipped — {expected_month_name} {expected_year} already downloaded",
-            body="\n".join(run_log),
-            status="info",
+            body="\n".join(run_log), status="info",
         )
         sys.exit(0)
 
-    # -------------------------------------------------------------------------
-    # PROBE DGI SITE
-    # -------------------------------------------------------------------------
+    # ── Probe DGI site ────────────────────────────────────────────────────────
     if not probe_latest_file_available():
         log(f"ℹ️  {expected_month_name} {expected_year} not yet on DGI site. "
             f"Will retry next scheduled run.")
         send_email_notification(
             subject=f"Skipped — {expected_month_name} {expected_year} not yet published",
-            body="\n".join(run_log),
-            status="warning",
+            body="\n".join(run_log), status="warning",
         )
         sys.exit(0)
 
-    log(f"✅ New file confirmed available — proceeding with full pipeline.\n")
+    log(f"✅ New file confirmed — proceeding with full pipeline.\n")
 
-    # -------------------------------------------------------------------------
-    # FULL PIPELINE
-    # -------------------------------------------------------------------------
+    # ── Download ──────────────────────────────────────────────────────────────
     months_to_process = get_month_list()
     log(f"📊 Will process {len(months_to_process)} months")
-
     downloaded, skipped, failed, failed_files = download_all_parallel(months_to_process)
 
-    parquet_path = combine_to_parquet(newly_downloaded=downloaded)
+    # ── Build Parquets ────────────────────────────────────────────────────────
+    current_path, presence_path = build_parquets(newly_downloaded=downloaded)
 
+    # ── Drive upload ──────────────────────────────────────────────────────────
     log("\n🔐 Authenticating Google Drive...")
     drive_service = authenticate_drive()
 
     uploaded = kept = deleted = 0
     if drive_service and DRIVE_FOLDER_ID:
-        log("\n📤 Uploading to Google Drive...")
-        uploaded = upload_to_drive(drive_service, DRIVE_FOLDER_ID)
-        log(f"   Uploaded: {uploaded} files")
+        log("\n📤 Uploading to Google Drive (2 files)...")
+        uploaded = upload_all_to_drive(drive_service, DRIVE_FOLDER_ID)
+        log(f"   Uploaded: {uploaded} file(s)")
 
-        log("\n🧹 Cleaning up files older than 5 years...")
+        log("\n🧹 Cleaning up Excel files older than 5 years...")
         kept, deleted = cleanup_old_files(drive_service, DRIVE_FOLDER_ID, cutoff_date)
         log(f"   Kept: {kept}, Deleted: {deleted}")
     else:
         log("\n⚠️ Skipping Drive operations (no credentials or folder ID)")
 
-    # -------------------------------------------------------------------------
-    # WRITE SENTINEL — only after the expected latest file is confirmed on disk
-    # -------------------------------------------------------------------------
+    # ── Sentinel ──────────────────────────────────────────────────────────────
     latest_filename = f"FICHIER_{expected_month_name}_{expected_year}.xlsx"
-    latest_path     = os.path.join(DOWNLOAD_DIR, latest_filename)
-
-    if os.path.exists(latest_path):
+    if os.path.exists(os.path.join(DOWNLOAD_DIR, latest_filename)):
         write_sentinel(expected_year, expected_month)
         log(f"\n✅ Sentinel updated → '{sentinel_month_key(expected_year, expected_month)}'")
-        log("   (Workflow will commit this to the repo to cancel remaining runs this month)")
     else:
-        log(f"\n⚠️  Latest file ({latest_filename}) not on disk — sentinel NOT updated.")
-        log("   Next scheduled run will try again.")
+        log(f"\n⚠️  {latest_filename} not on disk — sentinel NOT updated. Will retry.")
 
-    # -------------------------------------------------------------------------
-    # SUMMARY + EMAIL
-    # -------------------------------------------------------------------------
-    end_time   = datetime.now()
-    duration   = end_time - start_time
-    parquet_mb = (os.path.getsize(parquet_path) / 1024 / 1024
-                  if parquet_path and os.path.exists(parquet_path) else 0)
+    # ── Summary ───────────────────────────────────────────────────────────────
+    end_time  = datetime.now()
+    duration  = end_time - start_time
+    cur_mb = (os.path.getsize(current_path)  / 1024 / 1024
+              if current_path  and os.path.exists(current_path)  else 0)
+    pre_mb = (os.path.getsize(presence_path) / 1024 / 1024
+              if presence_path and os.path.exists(presence_path) else 0)
 
     summary_lines = [
         "",
         "=" * 70,
         "✅ EXECUTION COMPLETE",
-        f"   Run duration:  {duration}",
-        f"   Downloaded:    {downloaded} new files",
-        f"   Skipped:       {skipped} (already existed)",
-        f"   Failed:        {failed} (not found or error)",
-        f"   Parquet:       {parquet_mb:.1f} MB",
-        f"   Drive upload:  {uploaded} file(s)",
-        f"   Drive cleanup: kept {kept}, deleted {deleted}",
+        f"   Run duration         : {duration}",
+        f"   Downloaded           : {downloaded} new files",
+        f"   Skipped              : {skipped} (already existed)",
+        f"   Failed               : {failed} (not found or error)",
+        f"   DGI_CURRENT.parquet  : {cur_mb:.1f} MB",
+        f"   DGI_PRESENCE.parquet : {pre_mb:.1f} MB",
+        f"   Total in Power BI    : {cur_mb + pre_mb:.1f} MB  (was 660 MB)",
+        f"   Drive upload         : {uploaded} file(s)",
+        f"   Drive cleanup        : kept {kept}, deleted {deleted}",
         f"Finished: {end_time.strftime('%Y-%m-%d %H:%M:%S UTC')}",
         "=" * 70,
     ]
@@ -696,7 +712,7 @@ def main():
 
     overall_status = (
         "error"   if failed > downloaded else
-        "success" if downloaded > 0     else
+        "success" if downloaded > 0      else
         "warning"
     )
     send_email_notification(
