@@ -32,6 +32,7 @@ import time
 import smtplib
 import requests
 import pandas as pd
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 from email.mime.text import MIMEText
@@ -47,7 +48,7 @@ import random
 # CONFIGURATION
 # =============================================================================
 YEARS_TO_KEEP    = 5
-DOWNLOAD_WORKERS = 3
+DOWNLOAD_WORKERS = 5
 MAX_RETRIES      = 5
 RETRY_DELAY      = 5
 REQUEST_TIMEOUT  = 20
@@ -73,8 +74,10 @@ CANONICAL_COLUMNS = [
 
 # ── Parquet schemas ──────────────────────────────────────────────────────────
 
-# Current-month full snapshot (Power BI: lookup / drill-through)
+# Current-month full snapshot (Power BI: lookup / drill-through / slicer)
+# NIU_ID is the integer FK that links to DGI_PRESENCE — keeps NIU string too for display
 CURRENT_SCHEMA = pa.schema([
+    pa.field('NIU_ID',                 pa.int32()),
     pa.field('YEAR',                   pa.int16()),
     pa.field('MONTH',                  pa.int16()),
     pa.field('RAISON_SOCIALE',         pa.string()),
@@ -86,12 +89,13 @@ CURRENT_SCHEMA = pa.schema([
     pa.field('CENTRE_DE_RATTACHEMENT', pa.string()),
 ])
 
-# Per-taxpayer monthly presence (Power BI: all visuals)
-# 3 narrow columns — NIU dictionary-encoded → ~60 MB for 17M rows
+# Per-taxpayer monthly presence (Power BI: all visuals — heatmap, trends, KPIs)
+# int32 NIU_ID instead of string: 16.7M × 4 bytes = ~50-60 MB after snappy
+# Relationship: DGI_CURRENT[NIU_ID] → DGI_PRESENCE[NIU_ID]  (1-to-many, both)
 PRESENCE_SCHEMA = pa.schema([
-    pa.field('NIU',   pa.dictionary(pa.int32(), pa.string())),
-    pa.field('YEAR',  pa.int16()),
-    pa.field('MONTH', pa.int16()),
+    pa.field('NIU_ID', pa.int32()),
+    pa.field('YEAR',   pa.int16()),
+    pa.field('MONTH',  pa.int16()),
 ])
 
 BASE_HOST        = "https://teledeclaration-dgi.cm/UploadedFiles/AttachedFiles/ArchiveListecontribuable"
@@ -344,18 +348,24 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_parquets(newly_downloaded: int) -> tuple:
     """
-    Build both Power BI output files in a single chronological pass.
+    Build both Power BI output files.
 
-    DGI_CURRENT.parquet  — latest month full snapshot  (~533k rows, ~40 MB)
-    DGI_PRESENCE.parquet — NIU × YEAR × MONTH presence (~17M rows, ~60 MB)
+    DGI_CURRENT.parquet  — latest month full snapshot  (~533k rows, ~15-20 MB)
+    DGI_PRESENCE.parquet — NIU_ID × YEAR × MONTH       (~17M rows,  ~50-60 MB)
 
-    Memory strategy
-    ───────────────
-    Only ONE month's DataFrame is in RAM at a time.
-    PRESENCE is written incrementally via streaming ParquetWriter — no
-    accumulation, no giant concat. Peak RAM ≈ one month (~120 MB).
+    Why int32 NIU_ID instead of NIU strings
+    ────────────────────────────────────────
+    The previous streaming approach wrote 59 separate row groups, each with its
+    own independent string dictionary. This meant NIU strings (~14 bytes each)
+    were encoded 59 times → 331 MB. With int32 IDs (4 bytes, range 0-600k),
+    we accumulate compact numpy arrays then write ONE table. Snappy compresses
+    small integers extremely well → target ~50-60 MB.
 
-    Skips rebuild if both files already exist and nothing new was downloaded.
+    Memory
+    ──────
+    Non-latest months: read full Excel but extract only NIU column → discard rest.
+    Accumulators: int32 + int16 + int16 arrays → ~135 MB total for 17M rows.
+    Peak RAM during final concat + write: ~300 MB. Well within GHA 7 GB limit.
     """
     both_exist = (
         os.path.exists(CURRENT_PARQUET) and
@@ -368,7 +378,7 @@ def build_parquets(newly_downloaded: int) -> tuple:
               f"(Current: {cur_mb:.1f} MB, Presence: {pre_mb:.1f} MB)")
         return CURRENT_PARQUET, PRESENCE_PARQUET
 
-    print("\n📊 Building CURRENT + PRESENCE (single pass)...")
+    print("\n📊 Building CURRENT + PRESENCE...")
 
     # ── Collect and sort files chronologically ───────────────────────────────
     dated_files = []
@@ -398,68 +408,115 @@ def build_parquets(newly_downloaded: int) -> tuple:
         excel_engine = 'openpyxl'
         print("  ⚠ Excel engine: openpyxl (install python-calamine for speedup)")
 
-    total_presence_rows = 0
+    # ── Global NIU → int32 ID map (grows as new NIUs are encountered) ─────────
+    niu_to_id: dict = {}
 
-    # ── Open streaming PRESENCE writer — stays open for the entire loop ──────
-    with pq.ParquetWriter(
-        PRESENCE_PARQUET, schema=PRESENCE_SCHEMA,
-        compression='snappy',
-        use_dictionary=True,   # key: dictionary-encodes NIU → ~60 MB for 17M rows
-        write_statistics=True,
-    ) as presence_writer:
+    # ── Lightweight accumulators — int arrays only, ~135 MB for 17M rows ─────
+    acc_ids    = []   # list of np.ndarray[int32]  one per month
+    acc_years  = []   # list of np.ndarray[int16]
+    acc_months = []   # list of np.ndarray[int16]
+    total_rows = 0
 
-        for i, (year, month, filename) in enumerate(dated_files, 1):
-            filepath = os.path.join(DOWNLOAD_DIR, filename)
-            try:
-                raw = pd.read_excel(filepath, sheet_name=0, dtype=str, engine=excel_engine)
-                raw.dropna(how='all', inplace=True)
-                df  = normalize_df(raw)
-            except Exception as e:
-                print(f"  [{i}/{total}] ✗ Failed to read {filename}: {e}")
-                continue
+    current_df = None  # stash latest month's full DataFrame until IDs are ready
 
+    for i, (year, month, filename) in enumerate(dated_files, 1):
+        filepath  = os.path.join(DOWNLOAD_DIR, filename)
+        is_latest = (year == latest_year and month == latest_month)
+        try:
+            raw = pd.read_excel(filepath, sheet_name=0, dtype=str, engine=excel_engine)
+            raw.dropna(how='all', inplace=True)
+        except Exception as e:
+            print(f"  [{i}/{total}] ✗ Failed to read {filename}: {e}")
+            continue
+
+        if is_latest:
+            # Latest month: need all columns for DGI_CURRENT
+            df       = normalize_df(raw)
             df_valid = df[df['NIU'] != ''].copy()
+            nius     = df_valid['NIU'].values
+            del df, raw
+        else:
+            # Older months: extract NIU column only, discard everything else
+            raw.columns = [str(c).strip().upper() for c in raw.columns]
+            if 'NIU' not in raw.columns:
+                print(f"  [{i}/{total}] ⚠ NIU column missing — skipping {filename}")
+                del raw
+                continue
+            s    = raw['NIU'].astype(str).str.strip()
+            nius = s[(s != '') & (s != 'nan')].values
+            del raw, s
 
-            # ── Write presence rows for this month ───────────────────────────
-            # pd.Categorical tells PyArrow to use dictionary encoding on NIU
-            n = len(df_valid)
-            presence_table = pa.Table.from_pandas(
-                pd.DataFrame({
-                    'NIU':   pd.Categorical(df_valid['NIU']),
-                    'YEAR':  pd.array([year]  * n, dtype='int16'),
-                    'MONTH': pd.array([month] * n, dtype='int16'),
-                }),
-                schema=PRESENCE_SCHEMA,
-                preserve_index=False,
-            )
-            presence_writer.write_table(presence_table, row_group_size=200_000)
-            total_presence_rows += n
+        n = len(nius)
 
-            # ── Write CURRENT for the latest month only ──────────────────────
-            if year == latest_year and month == latest_month:
-                df_current = df_valid.copy()
-                df_current.insert(0, 'MONTH', pd.array([month] * n, dtype='int16'))
-                df_current.insert(0, 'YEAR',  pd.array([year]  * n, dtype='int16'))
-                pq.write_table(
-                    pa.Table.from_pandas(df_current, schema=CURRENT_SCHEMA, preserve_index=False),
-                    CURRENT_PARQUET,
-                    compression='snappy', use_dictionary=True, write_statistics=True,
-                )
-                cur_mb = os.path.getsize(CURRENT_PARQUET) / 1024 / 1024
-                print(f"  [{i}/{total}] ✓ {filename} — {n:,} rows → CURRENT ({cur_mb:.1f} MB) + PRESENCE")
-            else:
-                print(f"  [{i}/{total}] ✓ {filename} — {n:,} rows → PRESENCE")
+        # ── Assign int32 IDs — vectorised via pandas map ─────────────────────
+        s_nius   = pd.Series(nius)
+        new_nius = s_nius[~s_nius.isin(niu_to_id)].unique()
+        start    = len(niu_to_id)
+        niu_to_id.update(zip(new_nius, range(start, start + len(new_nius))))
+        ids = s_nius.map(niu_to_id).to_numpy(dtype=np.int32)
 
-            # Free this month from RAM before loading the next one
-            del df, df_valid, raw, presence_table
+        acc_ids.append(ids)
+        acc_years.append(np.full(n, year,  dtype=np.int16))
+        acc_months.append(np.full(n, month, dtype=np.int16))
+        total_rows += n
 
-    # PRESENCE writer flushed and closed here
+        if is_latest:
+            df_valid['NIU_ID'] = ids   # stash with IDs for writing after loop
+            current_df = df_valid
+            print(f"  [{i}/{total}] ✓ {filename} — {n:,} rows → CURRENT + PRESENCE")
+        else:
+            print(f"  [{i}/{total}] ✓ {filename} — {n:,} rows → PRESENCE")
+
+        del nius, s_nius, ids
+
+    # ── Write DGI_CURRENT ─────────────────────────────────────────────────────
+    if current_df is not None:
+        n = len(current_df)
+        # Reorder: NIU_ID first, then YEAR/MONTH, then the rest
+        out = pd.DataFrame({
+            'NIU_ID':                 current_df['NIU_ID'].astype(np.int32),
+            'YEAR':                   pd.array([latest_year]  * n, dtype='int16'),
+            'MONTH':                  pd.array([latest_month] * n, dtype='int16'),
+            'RAISON_SOCIALE':         current_df['RAISON_SOCIALE'],
+            'SIGLE':                  current_df['SIGLE'],
+            'NIU':                    current_df['NIU'],
+            'ACTIVITE_PRINCIPALE':    current_df['ACTIVITE_PRINCIPALE'],
+            'REGIME':                 current_df['REGIME'],
+            'CRI':                    current_df['CRI'],
+            'CENTRE_DE_RATTACHEMENT': current_df['CENTRE_DE_RATTACHEMENT'],
+        })
+        pq.write_table(
+            pa.Table.from_pandas(out, schema=CURRENT_SCHEMA, preserve_index=False),
+            CURRENT_PARQUET,
+            compression='snappy', use_dictionary=True, write_statistics=True,
+        )
+        del current_df, out
+
+    # ── Write DGI_PRESENCE as ONE table ───────────────────────────────────────
+    # Concatenate accumulators then write in a single call.
+    # snappy sees the full int32 column at once → far better compression than
+    # 59 independent row groups (which produced 331 MB previously).
+    all_ids    = np.concatenate(acc_ids)     # ~67 MB int32
+    all_years  = np.concatenate(acc_years)   # ~33 MB int16
+    all_months = np.concatenate(acc_months)  # ~33 MB int16
+    del acc_ids, acc_years, acc_months
+
+    pq.write_table(
+        pa.table({
+            'NIU_ID': pa.array(all_ids,    type=pa.int32()),
+            'YEAR':   pa.array(all_years,  type=pa.int16()),
+            'MONTH':  pa.array(all_months, type=pa.int16()),
+        }),
+        PRESENCE_PARQUET,
+        compression='snappy', write_statistics=True,
+    )
+    del all_ids, all_years, all_months
 
     cur_mb = os.path.getsize(CURRENT_PARQUET)  / 1024 / 1024 if os.path.exists(CURRENT_PARQUET) else 0
     pre_mb = os.path.getsize(PRESENCE_PARQUET) / 1024 / 1024
 
-    print(f"\n  ✅ CURRENT  : {cur_mb:.1f} MB  (~{latest_year}-{latest_month:02d} snapshot)")
-    print(f"  ✅ PRESENCE : {pre_mb:.1f} MB  ({total_presence_rows:,} rows)")
+    print(f"\n  ✅ CURRENT  : {cur_mb:.1f} MB  (Feb {latest_year} snapshot)")
+    print(f"  ✅ PRESENCE : {pre_mb:.1f} MB  ({total_rows:,} rows, int32 NIU_ID)")
     print(f"\n  📉 Total in Power BI: {cur_mb + pre_mb:.1f} MB  (was 660 MB)")
 
     return CURRENT_PARQUET, PRESENCE_PARQUET
