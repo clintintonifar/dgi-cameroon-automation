@@ -39,9 +39,6 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 import random
 
 # =============================================================================
@@ -522,135 +519,6 @@ def build_parquets(newly_downloaded: int) -> tuple:
     return CURRENT_PARQUET, PRESENCE_PARQUET
 
 # =============================================================================
-# GOOGLE DRIVE
-# =============================================================================
-
-def authenticate_drive():
-    try:
-        print("  🔍 Checking env vars:")
-        for var in ['GOOGLE_REFRESH_TOKEN', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET']:
-            status = '✅ Set' if os.environ.get(var) else '❌ Missing'
-            print(f"     {var}: {status}")
-
-        refresh_token = os.environ.get('GOOGLE_REFRESH_TOKEN')
-        client_id     = os.environ.get('GOOGLE_CLIENT_ID')
-        client_secret = os.environ.get('GOOGLE_CLIENT_SECRET')
-
-        if not all([refresh_token, client_id, client_secret]):
-            print("  ⚠️ Missing credentials — skipping upload")
-            return None
-
-        creds = Credentials(
-            None, refresh_token=refresh_token,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=client_id, client_secret=client_secret,
-            scopes=['https://www.googleapis.com/auth/drive'],
-        )
-        service = build('drive', 'v3', credentials=creds)
-        print("  ✅ Google Drive authenticated via OAuth")
-        return service
-    except Exception as e:
-        print(f"  ⚠️ Drive auth failed: {e}")
-        return None
-
-
-def list_drive_files(service, folder_id, mime_type=None):
-    query = f"'{folder_id}' in parents"
-    if mime_type:
-        query += f" and mimeType='{mime_type}'"
-    files, page_token = [], None
-    while True:
-        kwargs = {
-            'q': query, 'fields': 'nextPageToken, files(id, name)',
-            'supportsAllDrives': True, 'pageSize': 1000,
-        }
-        if page_token:
-            kwargs['pageToken'] = page_token
-        result     = service.files().list(**kwargs).execute()
-        files     += result.get('files', [])
-        page_token = result.get('nextPageToken')
-        if not page_token:
-            break
-    return files
-
-
-def upload_file_to_drive(service, local_path: str, drive_name: str, folder_id: str) -> bool:
-    """
-    Upload a single file to Drive, updating in-place if it already exists.
-    Returns True on success.
-    """
-    try:
-        existing = [
-            f for f in list_drive_files(service, folder_id)
-            if f['name'] == drive_name
-        ]
-        media = MediaFileUpload(local_path, mimetype='application/octet-stream', resumable=True)
-
-        if existing:
-            file_id = existing[0]['id']
-            # Remove any duplicates beyond the first
-            for dup in existing[1:]:
-                service.files().delete(fileId=dup['id'], supportsAllDrives=True).execute()
-                print(f"  🗑 Removed duplicate: {drive_name} (ID: {dup['id']})")
-            service.files().update(
-                fileId=file_id, media_body=media, supportsAllDrives=True
-            ).execute()
-            print(f"  ✓ Updated in-place: {drive_name} (file ID & link preserved ✅)")
-        else:
-            service.files().create(
-                body={'name': drive_name, 'parents': [folder_id]},
-                media_body=media, fields='id', supportsAllDrives=True,
-            ).execute()
-            print(f"  ✓ Created new: {drive_name} (first upload)")
-            print(f"  ℹ️  Share this file's link now — it will never change.")
-        return True
-    except Exception as e:
-        print(f"  ✗ Upload failed for {drive_name}: {e}")
-        return False
-
-
-def upload_all_to_drive(service, folder_id: str) -> int:
-    """Upload both Parquet files to Drive. Returns count of successful uploads."""
-    if not service or not folder_id:
-        print("  ⚠️ Skipping upload (no service or folder ID)")
-        return 0
-
-    uploads = 0
-    for local_path, drive_name in [
-        (CURRENT_PARQUET,  'DGI_CURRENT.parquet'),
-        (PRESENCE_PARQUET, 'DGI_PRESENCE.parquet'),
-    ]:
-        if os.path.exists(local_path):
-            if upload_file_to_drive(service, local_path, drive_name, folder_id):
-                uploads += 1
-        else:
-            print(f"  ⚠ Skipping {drive_name} — file not found locally")
-    return uploads
-
-
-def cleanup_old_files(service, folder_id, cutoff_date):
-    if not service:
-        return 0, 0
-    deleted = kept = 0
-    try:
-        xlsx_mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        for f in list_drive_files(service, folder_id, mime_type=xlsx_mime):
-            parsed = parse_filename_to_date(f['name'])
-            if parsed:
-                year, month = parsed
-                if datetime(year, month, 1) >= cutoff_date:
-                    kept += 1
-                else:
-                    service.files().delete(fileId=f['id'], supportsAllDrives=True).execute()
-                    print(f"  🗑 Deleted old: {f['name']}")
-                    deleted += 1
-            else:
-                kept += 1
-    except Exception as e:
-        print(f"  ⚠️ Cleanup error: {e}")
-    return kept, deleted
-
-# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -667,19 +535,17 @@ def main():
     log(f"Started: {start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
     log("=" * 70)
 
-    DRIVE_FOLDER_ID = os.environ.get('DRIVE_FOLDER_ID', '')
-    now             = datetime.now()
-    cutoff_date     = datetime(now.year - YEARS_TO_KEEP, 1, 1)
+    now          = datetime.now()
     expected_year, expected_month = get_expected_latest_month()
     expected_month_name = FRENCH_MONTHS[expected_month]
 
-    log(f"📅 Data window: {cutoff_date.strftime('%Y-%m')} → "
+    log(f"📅 Data window: {now.year - YEARS_TO_KEEP}-01 → "
         f"{expected_year}-{expected_month:02d} (latest expected)")
     log(f"📄 Sentinel   : '{read_sentinel()}' → expected '{sentinel_month_key(expected_year, expected_month)}'")
     log("")
-    log("📦 Output: 2 files")
-    log("   DGI_CURRENT.parquet  — latest month snapshot  (~533k rows, ~40 MB)")
-    log("   DGI_PRESENCE.parquet — NIU×YEAR×MONTH, all 62 months (~17M rows, ~60 MB)")
+    log("📦 Output: 2 files → GitHub Release assets")
+    log("   DGI_CURRENT.parquet  — latest month snapshot  (~20 MB)")
+    log("   DGI_PRESENCE.parquet — NIU×YEAR×MONTH, all months (~65 MB)")
 
     # ── Sentinel check ────────────────────────────────────────────────────────
     if sentinel_already_downloaded():
@@ -712,22 +578,6 @@ def main():
     # ── Build Parquets ────────────────────────────────────────────────────────
     current_path, presence_path = build_parquets(newly_downloaded=downloaded)
 
-    # ── Drive upload ──────────────────────────────────────────────────────────
-    log("\n🔐 Authenticating Google Drive...")
-    drive_service = authenticate_drive()
-
-    uploaded = kept = deleted = 0
-    if drive_service and DRIVE_FOLDER_ID:
-        log("\n📤 Uploading to Google Drive (2 files)...")
-        uploaded = upload_all_to_drive(drive_service, DRIVE_FOLDER_ID)
-        log(f"   Uploaded: {uploaded} file(s)")
-
-        log("\n🧹 Cleaning up Excel files older than 5 years...")
-        kept, deleted = cleanup_old_files(drive_service, DRIVE_FOLDER_ID, cutoff_date)
-        log(f"   Kept: {kept}, Deleted: {deleted}")
-    else:
-        log("\n⚠️ Skipping Drive operations (no credentials or folder ID)")
-
     # ── Sentinel ──────────────────────────────────────────────────────────────
     latest_filename = f"FICHIER_{expected_month_name}_{expected_year}.xlsx"
     if os.path.exists(os.path.join(DOWNLOAD_DIR, latest_filename)):
@@ -737,12 +587,10 @@ def main():
         log(f"\n⚠️  {latest_filename} not on disk — sentinel NOT updated. Will retry.")
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    end_time  = datetime.now()
-    duration  = end_time - start_time
-    cur_mb = (os.path.getsize(current_path)  / 1024 / 1024
-              if current_path  and os.path.exists(current_path)  else 0)
-    pre_mb = (os.path.getsize(presence_path) / 1024 / 1024
-              if presence_path and os.path.exists(presence_path) else 0)
+    end_time = datetime.now()
+    duration = end_time - start_time
+    cur_mb   = os.path.getsize(current_path)  / 1024 / 1024 if current_path  and os.path.exists(current_path)  else 0
+    pre_mb   = os.path.getsize(presence_path) / 1024 / 1024 if presence_path and os.path.exists(presence_path) else 0
 
     summary_lines = [
         "",
@@ -755,8 +603,7 @@ def main():
         f"   DGI_CURRENT.parquet  : {cur_mb:.1f} MB",
         f"   DGI_PRESENCE.parquet : {pre_mb:.1f} MB",
         f"   Total in Power BI    : {cur_mb + pre_mb:.1f} MB  (was 660 MB)",
-        f"   Drive upload         : {uploaded} file(s)",
-        f"   Drive cleanup        : kept {kept}, deleted {deleted}",
+        f"   Upload               : handled by YAML (gh release upload)",
         f"Finished: {end_time.strftime('%Y-%m-%d %H:%M:%S UTC')}",
         "=" * 70,
     ]

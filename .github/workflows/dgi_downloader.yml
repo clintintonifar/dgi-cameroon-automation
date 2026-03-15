@@ -1,0 +1,197 @@
+# =============================================================================
+# DGI Cameroon - Smart Monthly Downloader (GitHub Releases Edition)
+#
+# Schedule: 4 targeted attempts per month on days 2, 5, 10, and 15.
+#
+# Storage: GitHub Releases (no tokens, no OAuth, no expiry)
+#   Files are published as assets on a single rolling release tagged "latest-data".
+#   Every run replaces the assets in-place — the download URLs never change:
+#     https://github.com/YOUR_USERNAME/YOUR_REPO/releases/latest/download/DGI_CURRENT.parquet
+#     https://github.com/YOUR_USERNAME/YOUR_REPO/releases/latest/download/DGI_PRESENCE.parquet
+#
+# Power BI connects to those two URLs directly via Web.Contents() in M.
+#
+# How the sentinel cancellation works:
+#   1. After a successful download, the Python script writes the downloaded
+#      month (e.g. "2026-02") to last_downloaded.txt in the repo root.
+#   2. The workflow commits and pushes that file back to the repo.
+#   3. On every subsequent run, the YAML reads last_downloaded.txt BEFORE
+#      installing Python. If it already contains this month's key, the
+#      entire job is skipped in ~5 seconds — zero Python overhead.
+#
+# Required GitHub Secrets:
+#   Email only: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, NOTIFY_EMAIL
+#   (Google Drive secrets are no longer needed and can be deleted)
+#
+# Required repo settings (one-time):
+#   Settings → Actions → General → Workflow permissions → Read and write ✅
+#   Repo must be PUBLIC for Power BI to access release assets without auth.
+# =============================================================================
+
+name: DGI Monthly Downloader
+
+on:
+  schedule:
+    - cron: '0 3 2 * *'    # Day 2  — first attempt
+    - cron: '0 3 5 * *'    # Day 5  — second attempt
+    - cron: '0 3 10 * *'   # Day 10 — third attempt
+    - cron: '0 3 15 * *'   # Day 15 — final safety net
+
+  workflow_dispatch:       # Manual trigger for testing / backfilling
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+    # ------------------------------------------------------------------
+    # Step 1: Checkout repository
+    # ------------------------------------------------------------------
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    # ------------------------------------------------------------------
+    # Step 2: Sentinel check — skip if already downloaded this month
+    # Reads last_downloaded.txt before Python even installs.
+    # ~5 seconds vs ~18 minutes — the primary cost-saving gate.
+    # ------------------------------------------------------------------
+    - name: Check sentinel — skip if already downloaded this month
+      id: sentinel
+      run: |
+        EXPECTED_KEY=$(python3 -c "
+        from datetime import datetime
+        now = datetime.now()
+        y, m = (now.year, now.month - 1) if now.month > 1 else (now.year - 1, 12)
+        print(f'{y}-{m:02d}')
+        ")
+        echo "Expected sentinel key: $EXPECTED_KEY"
+
+        CURRENT=""
+        if [ -f last_downloaded.txt ]; then
+          CURRENT=$(cat last_downloaded.txt | tr -d '[:space:]')
+        fi
+        echo "Current sentinel value: '$CURRENT'"
+
+        if [ "$CURRENT" = "$EXPECTED_KEY" ]; then
+          echo "✅ Already downloaded $EXPECTED_KEY — skipping this run."
+          echo "skip=true" >> $GITHUB_OUTPUT
+        else
+          echo "🔄 Sentinel mismatch — proceeding with pipeline."
+          echo "skip=false" >> $GITHUB_OUTPUT
+        fi
+
+    # ------------------------------------------------------------------
+    # Step 3: Setup Python
+    # ------------------------------------------------------------------
+    - name: Setup Python
+      if: steps.sentinel.outputs.skip == 'false'
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    # ------------------------------------------------------------------
+    # Step 4: Install dependencies
+    # ------------------------------------------------------------------
+    - name: Install dependencies
+      if: steps.sentinel.outputs.skip == 'false'
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    # ------------------------------------------------------------------
+    # Step 5: Run the DGI downloader script
+    # Probes DGI site → downloads all months → builds parquet files.
+    # Upload is handled by Step 6 below (gh release).
+    # ------------------------------------------------------------------
+    - name: Run DGI Downloader
+      if: steps.sentinel.outputs.skip == 'false'
+      env:
+        SMTP_HOST:     ${{ secrets.SMTP_HOST }}
+        SMTP_PORT:     ${{ secrets.SMTP_PORT }}
+        SMTP_USER:     ${{ secrets.SMTP_USER }}
+        SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        NOTIFY_EMAIL:  ${{ secrets.NOTIFY_EMAIL }}
+      run: python src/download_dgi.py
+
+    # ------------------------------------------------------------------
+    # Step 6: Publish parquet files to GitHub Releases
+    #
+    # Strategy: one rolling release tagged "latest-data".
+    #   - First run ever: creates the release.
+    #   - Every subsequent run: replaces assets in-place (--clobber).
+    #   - The tag stays the same forever so the /releases/latest/download/
+    #     URLs never change — Power BI never needs reconfiguring.
+    #
+    # gh CLI is pre-installed on all GitHub Actions ubuntu runners.
+    # GITHUB_TOKEN is automatically injected — no secrets needed.
+    # ------------------------------------------------------------------
+    - name: Publish to GitHub Releases
+      if: steps.sentinel.outputs.skip == 'false'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        TAG="latest-data"
+        CURRENT_FILE="/tmp/dgi_downloads/DGI_CURRENT.parquet"
+        PRESENCE_FILE="/tmp/dgi_downloads/DGI_PRESENCE.parquet"
+
+        # Verify both files exist before attempting upload
+        if [ ! -f "$CURRENT_FILE" ] || [ ! -f "$PRESENCE_FILE" ]; then
+          echo "⚠️  Parquet files not found — skipping release upload."
+          exit 0
+        fi
+
+        echo "📦 DGI_CURRENT.parquet  : $(du -sh $CURRENT_FILE  | cut -f1)"
+        echo "📦 DGI_PRESENCE.parquet : $(du -sh $PRESENCE_FILE | cut -f1)"
+
+        # Create the release if it doesn't exist yet (first run only)
+        if ! gh release view "$TAG" &>/dev/null; then
+          echo "🆕 Creating release '$TAG' for the first time..."
+          gh release create "$TAG" \
+            --title "DGI Cameroon — Latest Data" \
+            --notes "Auto-updated monthly by GitHub Actions. Power BI connects to the permanent URLs below." \
+            --prerelease
+          echo "✅ Release created."
+        else
+          echo "🔄 Release '$TAG' already exists — updating assets."
+        fi
+
+        # --clobber replaces existing asset with same name in one step
+        echo "⬆️  Uploading DGI_CURRENT.parquet..."
+        gh release upload "$TAG" "$CURRENT_FILE" --clobber
+
+        echo "⬆️  Uploading DGI_PRESENCE.parquet..."
+        gh release upload "$TAG" "$PRESENCE_FILE" --clobber
+
+        echo ""
+        echo "✅ Release assets updated. Permanent Power BI URLs:"
+        echo "   https://github.com/${{ github.repository }}/releases/latest/download/DGI_CURRENT.parquet"
+        echo "   https://github.com/${{ github.repository }}/releases/latest/download/DGI_PRESENCE.parquet"
+
+    # ------------------------------------------------------------------
+    # Step 7: Commit sentinel file back to repo
+    # ------------------------------------------------------------------
+    - name: Commit sentinel file
+      if: steps.sentinel.outputs.skip == 'false'
+      run: |
+        if git diff --quiet last_downloaded.txt 2>/dev/null && \
+           git ls-files --error-unmatch last_downloaded.txt 2>/dev/null; then
+          echo "ℹ️  Sentinel file unchanged — nothing to commit."
+        else
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_downloaded.txt
+          git commit -m "chore: update sentinel after successful DGI download [skip ci]"
+          git push
+          echo "✅ Sentinel committed and pushed."
+        fi
+
+    # ------------------------------------------------------------------
+    # Step 8: Upload logs as artifact (always runs — useful for debugging)
+    # ------------------------------------------------------------------
+    - name: Upload download logs
+      if: always()
+      uses: actions/upload-artifact@v5
+      with:
+        name: dgi-download-logs-${{ github.run_number }}
+        path: /tmp/dgi_downloads/
+        retention-days: 7
