@@ -52,7 +52,7 @@ jobs:
     # Step 1: Checkout repository
     # ------------------------------------------------------------------
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
 
     # ------------------------------------------------------------------
     # Step 2: Sentinel check — read last_downloaded.txt and compute the
@@ -155,7 +155,7 @@ jobs:
     # ------------------------------------------------------------------
     - name: Upload download logs
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: dgi-download-logs-${{ github.run_number }}
         path: /tmp/dgi_downloads/
